@@ -159,6 +159,8 @@
 #include <cuda_runtime.h>
 #if defined(STRATA_GPU_METAL)
 namespace strata::metal_engine {
+bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
+                const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
 bool window_summary_supported();
 bool window_continuation_supported();
 uint64_t window_summary_bytes();
@@ -15492,7 +15494,11 @@ int main(int argc, char** argv) {
             // Protocol 1 is a separate, opt-in driver, not repeated GEN. Every
             // ANEXT returns only after run/commit have completed on the one GPU.
             if (line == "ASYNC_CAPS") {
+#if defined(STRATA_GPU_METAL)
+                std::printf("ASYNC_CAPS %d 512 128 text\n", continuation_supported() ? 2 : 0);
+#else
                 std::printf("ASYNC_CAPS %d 512 1 text\n", continuation_supported() ? 1 : 0);
+#endif
                 std::fflush(stdout); continue;
             }
             const bool ainit = line.rfind("AGEN ", 0) == 0;
@@ -15558,8 +15564,15 @@ int main(int argc, char** argv) {
                         (unsigned long long)c.cursor, (unsigned long long)c.origin);
                     std::fflush(stdout); continue;
                 }
-                aid = line.substr(astep ? 6 : 8);
-                if (!strata::core::SummaryStateBank::valid_id(aid)) { aid = "INVALID"; refused("arguments", "invalid request identity"); continue; }
+                size_t summary_inputs = 1;
+                if (astep) {
+                    if (!strata::core::NativeContinuation::parse_step(line.substr(6), aid, summary_inputs)) {
+                        aid = "INVALID"; refused("arguments", "invalid step identity or input budget"); continue;
+                    }
+                } else {
+                    aid = line.substr(8);
+                    if (!strata::core::SummaryStateBank::valid_id(aid)) { aid = "INVALID"; refused("arguments", "invalid request identity"); continue; }
+                }
                 strata::core::NativeContinuation* cp = nullptr;
                 for (auto& c : continuations) if (c.id == aid) cp = &c;
                 if (!cp) { refused("identity", "no matching request"); continue; }
@@ -15579,14 +15592,31 @@ int main(int argc, char** argv) {
                     ~ContinuationBusy() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
                 } continuation_busy;
                 const bool prefill = c.prompt_remaining() != 0;
-                const size_t end = c.cursor + c.quantum_inputs();
+                const size_t end = c.cursor + c.quantum_inputs(summary_inputs);
                 ver.set_sampling(c.sampler);
                 if (!ver.set_logit_bias(c.bias, ae)) { std::printf("FATAL continuation sampler reset failed\n"); std::fflush(stdout); return 1; }
                 ver.set_head_sampling(!prefill);
                 ver.set_history(!prefill && c.sampler.penalty_last_n ? d_hist : nullptr,
                                 prefill ? 0 : c.sampler.penalty_last_n);
                 int32_t next = -1;
-                while (c.cursor < end) {
+                bool batched_summary_prefill = false;
+#if defined(STRATA_GPU_METAL)
+                if (prefill && c.summary && summary_inputs > 1) {
+                    // Use the existing prompt GEMM path on the selected summary
+                    // bank. Repeating the tiny speculative verify window would
+                    // still serialize input through matrix-vector kernels.
+                    std::vector<int64_t> inputs(c.ids.begin() + c.cursor, c.ids.begin() + end);
+                    if (!strata::metal_engine::prompt_run(inputs.data(), (int64_t)inputs.size(),
+                            (int64_t)c.cursor, nullptr, {}, ae) || cudaDeviceSynchronize() != cudaSuccess) {
+                        std::printf("FATAL continuation summary prefill failed\n"); std::fflush(stdout); return 1;
+                    }
+                    c.cursor = end;
+                    c.sampler.counter = (uint64_t)c.cursor;
+                    strata::core::progress_beat();
+                    batched_summary_prefill = true;
+                }
+#endif
+                while (!batched_summary_prefill && c.cursor < end) {
                     const int T = prefill ? (int)std::min<size_t>((size_t)S, end - c.cursor) : 1;
                     std::vector<int32_t> out((size_t)T);
                     if (!prefill && c.sampler.penalty_last_n) {

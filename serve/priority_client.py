@@ -11,6 +11,7 @@ from .priority import PriorityCancelled, PriorityError
 
 class ContinuationClient:
     CAPS = ["ASYNC_CAPS", "1", "512", "1", "text"]
+    IDLE_CAPS = ["ASYNC_CAPS", "2", "512", "128", "text"]
     PREP_CAPS = ["APREP_CAPS", "1", "legacy1"]
     # This first native driver does not silently ignore unsupported GEN keys.
     SUPPORTED_KEYS = {"temperature", "top_p", "top_k", "min_p", "penalty_last_n",
@@ -19,6 +20,7 @@ class ContinuationClient:
     def __init__(self, engine, scheduler, lane):
         self.engine, self.scheduler, self.lane = engine, scheduler, lane
         self.generation = engine.gen
+        self.idle_summary_inputs = False
 
     def poison(self, reason):
         self.scheduler.poison(reason)
@@ -93,11 +95,15 @@ class ContinuationClient:
     def discover(self):
         with self.engine._exclusive_control():
             self.engine._send_for(self.generation, "ASYNC_CAPS")
-            if self._sync_read() != self.CAPS:
+            capabilities = self._sync_read()
+            if capabilities not in (self.CAPS, self.IDLE_CAPS):
                 raise ValueError("native weighted continuation protocol unavailable")
+            self.idle_summary_inputs = capabilities == self.IDLE_CAPS
             self.engine._send_for(self.generation, "APREP_CAPS")
             if self._sync_read() != self.PREP_CAPS:
                 raise ValueError("native legacy-preparation continuation protocol unavailable")
+            if self.idle_summary_inputs:
+                print("[strata] summary input quanta: idle=128, foreground-pending=1, decode=1", flush=True)
 
     def _sampling_keys(self, sampling):
         keys = self.engine.sampling_keys(sampling or {}).strip().split()
@@ -330,7 +336,12 @@ class ContinuationClient:
                     with self.engine._exclusive_control():
                         in_flight = "quantum"
                         try:
-                            self.engine._send_for(self.generation, f"ANEXT {identity}")
+                            # A foreground arrival after this decision waits for at most
+                            # 128 committed summary inputs, then the ordinary weighted turn.
+                            budget = (self.scheduler.summary_input_quantum(owner)
+                                      if owner.summary and self.idle_summary_inputs else None)
+                            suffix = f" {budget}" if budget is not None else ""
+                            self.engine._send_for(self.generation, f"ANEXT {identity}{suffix}")
                         except BaseException as exc:
                             raise self.poison("native quantum write outcome is uncertain") from exc
                         while True:

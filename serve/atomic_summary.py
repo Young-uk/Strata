@@ -181,7 +181,7 @@ def qualified_runtime_pins(cfg):
     exe = ((cwd / exe) if not exe.is_absolute() else exe).resolve()
     here = Path(__file__).resolve().parent
     source_hashes = {name: _stable_file_sha(str(here / name), _file_identity(here / name))
-                     for name in ("server.py", "atomic_summary.py", "priority.py", "priority_client.py")}
+                     for name in ("server.py", "atomic_summary.py", "priority.py", "priority_client.py", "disk_session.py")}
     return dict(zip(QUALIFICATION_PIN_KEYS, (
         _stable_file_sha(str(exe), _file_identity(exe)),
         model_fingerprint(cfg),

@@ -8427,6 +8427,13 @@ def make_handler(svc: Service):
                                      "atomic_tool_preamble": 0,
                                      "atomic_completion_review": (svc.atomic_completion_review_qualified is True
                                          and svc.summary_lane.mode != "state-bank-v1" and svc.summary_lane.enabled and not svc.summary_lane.poisoned),
+                                     # Transport support only; this is not semantic qualification.
+                                     # The client must require explicit user opt-in independently.
+                                     "atomic_completion_review_experimental": (
+                                         svc.summary_lane.mode == "state-bank-v1"
+                                         and svc.summary_lane.enabled and not svc.summary_lane.poisoned
+                                         and (svc.summary_lane.scheduler is None
+                                              or svc.summary_lane.scheduler.status().get("recovery_required") is False)),
                                      "atomic_tool_policy": "plain-system-v1"})
             elif path == "/props":
                 if self._authorized():
@@ -10631,6 +10638,23 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         except (OSError, ValueError, TypeError):
             # No stable archive scope is safer than silently trusting an alias.
             svc.atomic_model_fingerprint = None
+    disk_session = None
+    if a.engine == "strata" and cfg.get("atomic_disk_session_dir"):
+        from serve.disk_session import DiskSession
+        try:
+            observed = atomic_summary.runtime_qualification_config(cfg, svc.engine)
+            identity = atomic_summary.qualified_runtime_pins(observed)
+            disk_session = DiskSession(cfg["atomic_disk_session_dir"], identity)
+            try:
+                if disk_session.restore(svc.engine) is None:
+                    print("[strata] disk session: no compatible saved session (cold start)", flush=True)
+            except Exception as exc:
+                print(f"[strata] disk session restore failed ({type(exc).__name__}); starting cold", flush=True)
+                # A failed device transfer may have changed native state or ended the pipe.
+                svc.engine.restart()
+        except Exception as exc:
+            disk_session = None
+            print(f"[strata] disk sessions unavailable ({type(exc).__name__})", flush=True)
     # Completion review is independent of automatic-compaction preferences,
     # but uses the same proven isolated lane. Neither flag enables the other.
     svc.atomic_completion_review_qualified = cfg.get("atomic_completion_review_qualified") is True
@@ -10887,7 +10911,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 print(f"[strata] drain deadline expired; cancelling {cancelled} owned request(s) ...", flush=True)
                 svc.wait_for_drain(5)
                 drained = False
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        def save_disk_session():
+            if disk_session is not None and drained:
+                try:
+                    disk_session.save(svc)
+                except Exception as exc:
+                    print(f"[strata] disk session save skipped ({type(exc).__name__}: {exc})", flush=True)
+        closers = [httpd.shutdown, save_disk_session, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         try:
             for close in filter(None, closers):

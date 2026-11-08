@@ -29,8 +29,23 @@ struct NativeContinuation {
     }
     bool active() const { return !id.empty() && !done; }
     size_t prompt_remaining() const { return cursor < origin - 1 ? origin - 1 - cursor : 0; }
-    size_t quantum_inputs() const {
-        return prompt_remaining() ? std::min<size_t>(summary ? 1 : 512, prompt_remaining()) : 1;
+    size_t quantum_inputs(size_t summary_inputs = 1) const {
+        const size_t bound = summary ? std::clamp<size_t>(summary_inputs, 1, 128) : 512;
+        return prompt_remaining() ? std::min<size_t>(bound, prompt_remaining()) : 1;
+    }
+    // Protocol 2: an optional bounded input budget for this quantum only.
+    // Legacy ANEXT <id> keeps its original one-input summary behavior.
+    static bool parse_step(const std::string& args, std::string& id, size_t& inputs) {
+        std::istringstream in(args);
+        std::string value, extra;
+        inputs = 1;
+        if (!(in >> id) || !SummaryStateBank::valid_id(id)) return false;
+        if (!(in >> value)) return true;
+        uint64_t n = 0;
+        auto parsed = std::from_chars(value.data(), value.data() + value.size(), n);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !n || n > 128 || (in >> extra)) return false;
+        inputs = (size_t)n;
+        return true;
     }
     static bool parse(const std::string& args, int64_t vocab, NativeContinuation& result, std::string& error) {
         NativeContinuation c;

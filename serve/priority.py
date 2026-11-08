@@ -178,6 +178,16 @@ class WeightedScheduler:
         finally:
             release()
 
+    def summary_input_quantum(self, owner):
+        """Choose only while holding the compute permit; arrivals wait at most this quantum."""
+        with self.cv:
+            self._check()
+            if not owner.summary or self.turn_owner is not owner:
+                raise PriorityError("summary input sizing requires the current compute permit")
+            foreground = self.owners[False]
+            waiting = any(not item.cancel.is_set() for item in self.waiters[False])
+            return 1 if (foreground is not None and not foreground.closed) or waiting else 128
+
     def close(self, owner):
         with self.cv:
             if self.turn_owner is owner:

@@ -99,6 +99,41 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(configure_optional_lane(SummaryLane(),engine,cfg,engine_name='strata',arch='qwen4exp'))
 
 class Capabilities(unittest.TestCase):
+    def test_experimental_review_transport_does_not_claim_qualification(self):
+        from serve.test_atomic_summary import Api
+        from serve.priority import WeightedScheduler
+        fixture = Api(); fixture.setUp()
+        try:
+            lane = fixture.svc.summary_lane
+            def advertised(expected):
+                status, body = fixture.call('/v1/models')
+                self.assertEqual(status, 200)
+                self.assertIs(body['atomic_completion_review_experimental'], expected)
+                self.assertIs(body['atomic_completion_review'], False)
+            advertised(False)  # No enabled isolated transport.
+            fixture.engine.summary_state = Bank().summary_state
+            lane.configure_state_bank(fixture.engine, 1024)
+            advertised(True)  # Serial state-bank transport is also experimental.
+            lane.scheduler = WeightedScheduler(fixture.svc.fifo, 8)
+            advertised(True)
+            lane.enabled = False
+            advertised(False)
+            lane.enabled = True
+            lane.poisoned = True
+            advertised(False)
+            lane.poisoned = False
+            lane.scheduler.poison('test recovery required')
+            advertised(False)
+            lane.scheduler = None
+            # Even a mistaken semantic config flag cannot qualify state-bank review.
+            fixture.svc.atomic_completion_review_qualified = True
+            advertised(True)
+            lane.mode = 'serial-snapshot-v1'
+            fixture.svc.atomic_completion_review_qualified = False
+            advertised(False)
+        finally:
+            fixture.doCleanups()
+
     def test_public_bank_contract(self):
         from serve.test_atomic_summary import Api
         fixture=Api();fixture.setUp()

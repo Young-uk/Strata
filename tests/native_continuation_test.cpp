@@ -22,6 +22,19 @@ int main() {
         long_prompt.cursor = 999; assert(long_prompt.quantum_inputs() == 1);
         long_prompt.cursor = 1000; assert(long_prompt.quantum_inputs() == 1);
     }
+    {
+        NativeContinuation idle; idle.summary = true; idle.origin = 1001;
+        assert(idle.quantum_inputs(128) == 128);
+        assert(idle.quantum_inputs(1) == 1);
+        assert(idle.quantum_inputs(999) == 128);
+        idle.cursor = 990; assert(idle.quantum_inputs(128) == 10);
+        idle.cursor = 1000; assert(idle.quantum_inputs(128) == 1); // decode never batches
+        std::string id; size_t inputs = 0;
+        assert(NativeContinuation::parse_step("ABC123", id, inputs) && inputs == 1);
+        assert(NativeContinuation::parse_step("ABC123 128", id, inputs) && inputs == 128);
+        for (const char* bad : {"", "a-b 128", "A 0", "A 129", "A -1", "A nan", "A 1 2"})
+            assert(!NativeContinuation::parse_step(bad, id, inputs));
+    }
     c.cursor = 2; assert(c.prompt_remaining() == 0);
     c.cursor++; c.ids.push_back(7); c.produced++;
     const auto preserved = c;
