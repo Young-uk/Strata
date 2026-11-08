@@ -308,6 +308,29 @@ std::optional<HostMemoryReading> sample_host_memory() {
 #endif
 }
 
+std::optional<SummaryHostHealth> sample_summary_host_health() {
+#if defined(__APPLE__)
+    SummaryHostHealth health;
+    size_t len = sizeof health.pressure;
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &health.pressure, &len, nullptr, 0) != 0 ||
+        len != sizeof health.pressure) return {};
+    struct xsw_usage swap{};
+    len = sizeof swap;
+    if (sysctlbyname("vm.swapusage", &swap, &len, nullptr, 0) != 0 || len != sizeof swap) return {};
+    vm_statistics64_data_t vs{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    const mach_port_t host = mach_host_self();
+    const auto result = host_statistics64(host, HOST_VM_INFO64, (host_info64_t) &vs, &count);
+    mach_port_deallocate(mach_task_self(), host);
+    if (result != KERN_SUCCESS || count != HOST_VM_INFO64_COUNT) return {};
+    health.swap_used = swap.xsu_used;
+    health.swapouts = vs.swapouts;
+    return health;
+#else
+    return {};  // This probe is used by the macOS summary gate only.
+#endif
+}
+
 std::optional<uint64_t> available_host_bytes() {
     const auto reading = sample_host_memory();
     if (!reading) return {};

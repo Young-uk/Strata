@@ -38,6 +38,9 @@
 #endif
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/core/summary_transaction.hpp"
+#include "strata/core/summary_state_bank.hpp"
+#include "strata/core/native_continuation.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
@@ -156,6 +159,12 @@
 #include <cuda_runtime.h>
 #if defined(STRATA_GPU_METAL)
 namespace strata::metal_engine {
+bool window_summary_supported();
+bool window_continuation_supported();
+uint64_t window_summary_bytes();
+bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err);
+bool window_summary_end(std::string& err);
+bool window_summary_select(bool summary, std::string& err);
 void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
@@ -218,12 +227,13 @@ static void df2_tap_dump(const float* dev, int64_t rows, int64_t pos0, int64_t f
 // Called only when the request asked (`req_logprobs >= 0`): a request without logprobs never reaches it, so the
 // default path does no work for this and prints exactly what it printed before.
 static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token, int k,
-                         const std::vector<int32_t>& allowed) {
+                         const std::vector<int32_t>& allowed, const char* request_id = nullptr) {
     if (k < 0) return;
+    const std::string tag = request_id ? std::string("ALP ") + request_id : "LP";
     static std::vector<float> row;
     row.resize((size_t) ver.vocab());
     if (!ver.copy_logits(t, row.data()) || token < 0 || (size_t) token >= row.size()) {
-        std::printf("LP nan\n");
+        std::printf("%s nan\n", tag.c_str());
         return;
     }
     float mx = -INFINITY;
@@ -231,7 +241,7 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
     double se = 0.0;
     for (const float v : row) se += std::exp((double) v - (double) mx);
     const double lse = (double) mx + std::log(se);
-    std::printf("LP %.6f", (double) row[(size_t) token] - lse);
+    std::printf("%s %.6f", tag.c_str(), (double) row[(size_t) token] - lse);
     if (!allowed.empty()) {
         // Only the ids the caller named; the server renormalises over them, which is what allowed_token_ids means.
         // The server refuses an id past the vocabulary with a 400 only when it can read the vocabulary size from the
@@ -11899,6 +11909,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        bool summary_pristine = true; // provenance, not inferred from empty/invalid cache state
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
@@ -11954,6 +11965,29 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // A summary borrows the existing device session, never a second model or KV slot.
+        // Whole cache objects move aside: their LRU/serial/reuse bookkeeping must survive too.
+        strata::core::SummaryTransaction summary_tx;
+        strata::core::SummaryStateBank summary_bank;
+        strata::core::NativeContinuation continuations[2];
+        bool continuation_summary_selected = false, summary_bank_nan = false;
+        std::vector<int32_t> summary_bank_live;
+        std::vector<ImgKey> summary_bank_imgs;
+        bool summary_bank_live_ok = false, summary_bank_pristine = false;
+        const int summary_prompt_cache = o.prompt_cache;
+        std::optional<strata::core::SummaryHostHealth> summary_health;
+        std::vector<ConvCheckpoint> summary_checks;
+        strata::core::ConversationCache summary_conversations(0, 0);
+        strata::prefill::KvaFloorRegistry summary_kva_floors;
+        uint64_t summary_clock = 0;
+        int64_t summary_tail = -1;
+        ConvCheckpoint::PromptPlan summary_plan;
+        bool summary_nf_prompt = false, summary_short_read = false;
+        bool summary_cvec_cached = true;
+        auto summary_supported = [&] {
+            return stages.empty() && !multi_gpu && o.peer_device < 1 && o.batch == 0 &&
+                   summary_prompt_cache > 0 && !use_mtp && !use_df2;
+        };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -14052,6 +14086,52 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        // Image keys and KV are in the disk snapshot; these additional vision inputs are not.
+        // Keep the original embedding storage/pointers by move and copy the small position table.
+        std::vector<int32_t> summary_mrope;
+        std::vector<float> summary_img_rows;
+        std::vector<const float*> summary_row_ptr;
+        bool summary_mrope_identity = true, summary_has_embd_rows = false;
+        // The saved host fields always belong to the INACTIVE bank. Swap them only
+        // after Metal has synchronously selected the matching device state.
+        auto continuation_select = [&](bool summary, std::string& e) -> bool {
+            if (!summary_bank.active()) {
+                if (summary) { e = "summary bank is not held"; return false; }
+                return true;
+            }
+            if (continuation_summary_selected == summary) return true;
+#if defined(STRATA_GPU_METAL)
+            if (!ver.wait_commit(e) || !strata::metal_engine::window_summary_select(summary, e)) return false;
+            live.swap(summary_bank_live); live_imgs.swap(summary_bank_imgs);
+            std::swap(live_ok, summary_bank_live_ok); std::swap(summary_pristine, summary_bank_pristine);
+            std::swap(nan_flush, summary_bank_nan);
+            img_rows.swap(summary_img_rows); row_ptr.swap(summary_row_ptr);
+            std::swap(mrope_identity, summary_mrope_identity);
+            bool had_rows = sp.embd_rows != nullptr;
+            sp.embd_rows = summary_has_embd_rows ? row_ptr.data() : nullptr;
+            summary_has_embd_rows = had_rows;
+            checks.swap(summary_checks); std::swap(conversations, summary_conversations);
+            std::swap(kva_floors, summary_kva_floors);
+            std::swap(check_clock, summary_clock); std::swap(tail_ckpt_len, summary_tail);
+            std::swap(seg_plan, summary_plan); std::swap(nf_prompt_windows, summary_nf_prompt);
+            std::swap(short_read_off_once, summary_short_read); std::swap(cvec_cached, summary_cvec_cached);
+            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(cvec_cached);
+            o.prompt_cache = summary ? 0 : summary_prompt_cache;
+            continuation_summary_selected = summary;
+            return true;
+#else
+            e = "continuations require Metal"; return false;
+#endif
+        };
+        auto continuation_supported = [&]() {
+#if defined(STRATA_GPU_METAL)
+            return summary_supported() && strata::metal_engine::window_continuation_supported() &&
+                !pipe && !kvg.on && !o.prefill_head_alias && !ajob &&
+                std::getenv("STRATA_FOLLOW") == nullptr && std::getenv("STRATA_FOLLOW_LOGPOS") == nullptr;
+#else
+            return false;
+#endif
+        };
         // ---- #533: VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache
         // until that much VRAM is free for other programs (a game, a CAD session), or grows it back towards its full
         // size when more than that is free.  Never on its own: only this command (the server's POST /v1/vram) moves
@@ -15350,6 +15430,232 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
+            // APREP owns this whole initial legacy prefill/first-token operation.
+            // The scope boundary follows ALL normal/early exits of the GEN body;
+            // ordinary GEN does not create it and keeps its original wire protocol.
+            struct AsyncPreparation {
+                std::string id;
+                size_t limit = 0, cursor = 0, produced = 0;
+                int32_t last_token = -1;
+                const char* status = "failed";
+                ~AsyncPreparation() {
+                    if (!id.empty()) {
+                        std::printf("APREPARED %s %llu %llu %s\n", id.c_str(),
+                            (unsigned long long)cursor, (unsigned long long)produced, status);
+                        std::fflush(stdout);
+                    }
+                }
+            } prep;
+            if (line == "APREP_CAPS") {
+                std::printf("APREP_CAPS %d legacy1\n", continuation_supported() ? 1 : 0);
+                std::fflush(stdout); continue;
+            }
+            if (line.rfind("APREP ", 0) == 0) {
+                std::istringstream input(line.substr(6));
+                std::string id, count, kind, rest;
+                uint64_t limit = 0;
+                bool parsed = bool(input >> id >> count >> kind) && strata::core::SummaryStateBank::valid_id(id);
+                if (parsed) {
+                    const auto n = std::from_chars(count.data(), count.data() + count.size(), limit);
+                    parsed = n.ec == std::errc{} && n.ptr == count.data() + count.size() && limit > 0 && limit <= INT32_MAX;
+                }
+                if (!parsed || (kind != "GEN" && kind != "GENI")) {
+                    std::printf("ASYNC_REFUSED INVALID arguments invalid APREP header\n"); std::fflush(stdout); continue;
+                }
+                prep.id = id; prep.limit = (size_t)limit;
+                if (!continuation_supported() || summary_tx.active() || continuations[0].active() ||
+                    continuations[0].id == id || continuations[1].id == id) {
+                    std::printf("ERR APREP unavailable configuration or main ownership\n"); continue;
+                }
+                std::getline(input, rest);
+                // Never accept then silently discard a legacy tuning/output option.
+                // These are captured below or used by the full legacy admission.
+                bool options_ok = true;
+                std::istringstream options(rest); std::string word;
+                while (options >> word) {
+                    const auto eq = word.find('='); if (eq == std::string::npos) break;
+                    const std::string key = word.substr(0, eq);
+                    bool known = false;
+                    for (const char* k : {"temperature", "top_p", "top_k", "min_p", "penalty_last_n", "penalty_repeat",
+                         "penalty_freq", "penalty_present", "seed", "pen_from", "logit_bias", "cvec", "logprobs", "allowed",
+                         "ckpt", "pin", "img_keys"}) if (key == k) known = true;
+                    if (!known) { options_ok = false; break; }
+                }
+                if (!options_ok) { std::printf("ERR APREP unsupported option\n"); continue; }
+                std::string e;
+                if (!continuation_select(false, e)) {
+                    std::printf("FATAL APREP main selection failed\n"); std::fflush(stdout); return 1;
+                }
+                summary_pristine = false;
+                line = kind + " 1" + rest;
+            }
+            // Protocol 1 is a separate, opt-in driver, not repeated GEN. Every
+            // ANEXT returns only after run/commit have completed on the one GPU.
+            if (line == "ASYNC_CAPS") {
+                std::printf("ASYNC_CAPS %d 512 1 text\n", continuation_supported() ? 1 : 0);
+                std::fflush(stdout); continue;
+            }
+            const bool ainit = line.rfind("AGEN ", 0) == 0;
+            const bool astep = line.rfind("ANEXT ", 0) == 0;
+            const bool acancel = line.rfind("ACANCEL ", 0) == 0;
+            if (ainit || astep || acancel) {
+                std::string ae, aid = "INVALID";
+                auto refused = [&](const char* code, const std::string& why) {
+                    std::printf("ASYNC_REFUSED %s %s %s\n", aid.c_str(), code, why.c_str()); std::fflush(stdout);
+                };
+                if (ainit) {
+                    strata::core::NativeContinuation incoming;
+                    if (!strata::core::NativeContinuation::parse(line.substr(5), n_vocab, incoming, ae)) {
+                        refused("arguments", ae); continue;
+                    }
+                    aid = incoming.id;
+                    if (!continuation_supported() || summary_tx.active() || nan_flush) {
+                        refused("configuration", "continuation unavailable for this configuration"); continue;
+                    }
+                    auto& c = continuations[incoming.summary ? 1 : 0];
+                    if (c.active() || continuations[0].id == aid || continuations[1].id == aid) {
+                        refused("busy", "lane or request identity already owned"); continue;
+                    }
+                    if (incoming.summary && !summary_bank.active()) {
+                        refused("bank", "summary bank is not held"); continue;
+                    }
+                    const uint64_t cap = incoming.summary ? 16384 : (uint64_t)o.max_context;
+                    if (incoming.origin + incoming.limit + 8 > cap || incoming.sampler.penalty_last_n > kPenaltyWindowCap) {
+                        refused("bounds", "prompt and output exceed lane or penalty capacity"); continue;
+                    }
+                    // Text-only v1 never changes image positions or embeddings. A
+                    // summary can run while an untouched main image context is held.
+                    const bool target_image = incoming.summary == continuation_summary_selected
+                        ? (!mrope_identity || !live_imgs.empty()) : (!summary_mrope_identity || !summary_bank_imgs.empty());
+                    if (target_image) { refused("images", "v1 does not admit a foreground image context"); continue; }
+                    const auto& target_live = incoming.summary == continuation_summary_selected ? live : summary_bank_live;
+                    const bool target_ok = incoming.summary == continuation_summary_selected ? live_ok : summary_bank_live_ok;
+                    const bool exact_prefix = target_ok && target_live.size() < incoming.origin &&
+                        std::equal(target_live.begin(), target_live.end(), incoming.ids.begin());
+                    if (!incoming.summary && !target_live.empty() && !exact_prefix) {
+                        refused("cache", "v1 requires an empty main or an exact live prefix; parked-cache restore is legacy only"); continue;
+                    }
+                    if (!ver.wait_commit(ae) || !continuation_select(incoming.summary, ae)) {
+                        std::printf("FATAL continuation bank selection failed\n"); std::fflush(stdout); return 1;
+                    }
+                    // Only initial admission may match the live prefix. ANEXT never
+                    // re-matches, restores, or rereads committed prompt/output tokens.
+                    if (live_ok && live.size() < incoming.origin &&
+                        std::equal(live.begin(), live.end(), incoming.ids.begin())) incoming.cursor = live.size();
+                    else {
+                        strata::core::session_zero(ss, g, nullptr, main_cs);
+                        if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+                            std::printf("FATAL continuation session reset failed\n"); std::fflush(stdout); return 1;
+                        }
+                        live.clear(); live_imgs.clear(); checks.clear(); tail_ckpt_len = -1; seg_plan = {};
+                    }
+                    if (!incoming.sampler.seed) incoming.sampler.seed =
+                        (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+                    if (strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"))) incoming.penalty_origin = 0;
+                    live_ok = true; summary_pristine = false;
+                    c = std::move(incoming);
+                    std::printf("AREADY %s %llu %llu\n", c.id.c_str(),
+                        (unsigned long long)c.cursor, (unsigned long long)c.origin);
+                    std::fflush(stdout); continue;
+                }
+                aid = line.substr(astep ? 6 : 8);
+                if (!strata::core::SummaryStateBank::valid_id(aid)) { aid = "INVALID"; refused("arguments", "invalid request identity"); continue; }
+                strata::core::NativeContinuation* cp = nullptr;
+                for (auto& c : continuations) if (c.id == aid) cp = &c;
+                if (!cp) { refused("identity", "no matching request"); continue; }
+                auto& c = *cp;
+                if (acancel) {
+                    // Native state stays at the last complete commit, and is usable
+                    // as a cache. Cancel only drops this owner's pending continuation.
+                    c = {};
+                    std::printf("ACANCELLED %s\n", aid.c_str()); std::fflush(stdout); continue;
+                }
+                if (c.done) { refused("done", "request has already completed"); continue; }
+                if (!continuation_select(c.summary, ae) || !ver.wait_commit(ae) || !adapt_tick(true)) {
+                    std::printf("FATAL continuation selection or quiescence failed\n"); std::fflush(stdout); return 1;
+                }
+                struct ContinuationBusy {
+                    ContinuationBusy() { strata::core::progress().busy.store(true); strata::core::progress_at("continuation quantum"); }
+                    ~ContinuationBusy() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                } continuation_busy;
+                const bool prefill = c.prompt_remaining() != 0;
+                const size_t end = c.cursor + c.quantum_inputs();
+                ver.set_sampling(c.sampler);
+                if (!ver.set_logit_bias(c.bias, ae)) { std::printf("FATAL continuation sampler reset failed\n"); std::fflush(stdout); return 1; }
+                ver.set_head_sampling(!prefill);
+                ver.set_history(!prefill && c.sampler.penalty_last_n ? d_hist : nullptr,
+                                prefill ? 0 : c.sampler.penalty_last_n);
+                int32_t next = -1;
+                while (c.cursor < end) {
+                    const int T = prefill ? (int)std::min<size_t>((size_t)S, end - c.cursor) : 1;
+                    std::vector<int32_t> out((size_t)T);
+                    if (!prefill && c.sampler.penalty_last_n) {
+                        const size_t origin = c.penalty_origin;
+                        std::vector<int32_t> hist((size_t)c.sampler.penalty_last_n);
+                        strata::kernels::penalty_rows(c.ids.data() + origin, (int64_t)(c.cursor - origin),
+                            c.ids.data() + c.cursor, 1, c.sampler.penalty_last_n, hist.data());
+                        if (cudaMemcpy(d_hist, hist.data(), hist.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                            std::printf("FATAL continuation penalty upload failed\n"); std::fflush(stdout); return 1;
+                        }
+                    }
+                    drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
+                    // Verifier uses Philox(seed, absolute input position). The stable
+                    // cursor is the draw counter, including after another lane runs.
+                    c.sampler.counter = (uint64_t)c.cursor;
+                    if (!ver.run(T, c.ids.data() + c.cursor, (int64_t)c.cursor, win_pool_fn, win_pool_user, out.data(), ae) ||
+                        drive.d.failed || ver.nonfinite_row() >= 0 || !ver.commit(T, ae) || !ver.wait_commit(ae)) {
+                        std::printf("FATAL continuation window failed\n"); std::fflush(stdout); return 1;
+                    }
+                    c.cursor += (size_t)T;
+                    c.sampler.counter = (uint64_t)c.cursor;
+                    if (!prefill) next = out[0];
+                    strata::core::progress_beat();
+                }
+                ver.set_head_sampling(true);
+                live.assign(c.ids.begin(), c.ids.begin() + c.cursor); live_ok = c.cache;
+                if (!prefill) {
+                    if (next < 0 || next >= n_vocab) { std::printf("FATAL continuation sampled invalid token\n"); std::fflush(stdout); return 1; }
+                    c.ids.push_back(next); ++c.produced;
+                    std::printf("AT %s %d\n", aid.c_str(), (int)next);
+                    if (c.logprobs >= 0) emit_lp_line(ver, 0, next, c.logprobs, c.allowed, aid.c_str());
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t)next) != o.eos_ids.end();
+                    c.done = eos || c.produced >= c.limit;
+                    if (c.done) std::printf("ADONE %s %s %llu\n", aid.c_str(), eos ? "stop" : "length", (unsigned long long)c.produced);
+                }
+                if (!c.done) std::printf("AYIELD %s %s %llu %llu\n", aid.c_str(), prefill ? "prefill" : "decode",
+                    (unsigned long long)c.cursor, (unsigned long long)c.produced);
+                std::fflush(stdout); continue;
+            }
+            // No untagged mutation can overwrite a live continuation. Bank creation
+            // and release are safe only at these already-drained command boundaries.
+            if (prep.id.empty() && (continuations[0].active() || continuations[1].active()) &&
+                line.rfind("SUMMARY_STATE_BEGIN ", 0) != 0 && line.rfind("SUMMARY_STATE_END ", 0) != 0 &&
+                line != "SUMMARY_STATE_CAPS" && line != "QUIT") {
+                std::printf("ASYNC_REFUSED INVALID busy live continuation owns the session\n"); std::fflush(stdout); continue;
+            }
+            // An attempted ordinary request may partially write state even if parsing/prefill later
+            // fails or is cancelled. Only successful EMPTY rollback may restore pristine provenance.
+            if (!summary_tx.active() && !summary_bank.active() && strata::core::SummaryTransaction::invalidates_pristine(line))
+                summary_pristine = false;
+            if (!summary_tx.allows(line) || (prep.id.empty() && !summary_bank.allows(line))) {
+                std::printf("SERR invalid 0 summary transaction active; restore it before other commands\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "SUMMARY_CAPS") {
+                std::printf("SUMMARY_CAPS %d %lld\n", summary_supported() ? 3 : 0,
+                            (long long) strata::core::SummaryTransaction::context);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "SUMMARY_STATE_CAPS") {
+                bool capable = false;
+#if defined(STRATA_GPU_METAL)
+                capable = summary_supported() && strata::metal_engine::window_summary_supported();
+#endif
+                std::printf("SUMMARY_STATE_CAPS %d 16384\n", capable ? 4 : 0);
+                std::fflush(stdout); continue;
+            }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -15459,6 +15765,94 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            const bool state_begin = line.rfind("SUMMARY_STATE_BEGIN ", 0) == 0;
+            const bool state_end = line.rfind("SUMMARY_STATE_END ", 0) == 0;
+            if (state_begin || state_end) {
+                uint64_t budget = 0;
+                std::string txid;
+                const bool parsed = state_begin
+                    ? strata::core::SummaryStateBank::parse_begin(line.substr(20), budget, txid)
+                    : strata::core::SummaryStateBank::valid_id(txid = line.substr(18));
+                auto refuse_state = [&](const std::string& reason) {
+                    std::string one = reason;
+                    for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                    std::printf("SUMMARY_STATE_REFUSED %s %s\n", parsed ? txid.c_str() : "INVALID", one.c_str());
+                    std::fflush(stdout);
+                };
+                if (!parsed) { refuse_state("invalid transaction arguments"); continue; }
+#if defined(STRATA_GPU_METAL)
+                if (state_begin) {
+                    if (summary_bank.active() || summary_tx.active() || !summary_supported() || nan_flush ||
+                        !strata::metal_engine::window_summary_supported() || summary_bank.epoch == UINT64_MAX) {
+                        refuse_state("state bank unavailable for this configuration or session"); continue;
+                    }
+                    const uint64_t bytes = strata::metal_engine::window_summary_bytes();
+                    if (!bytes || bytes > budget) { refuse_state("summary slot exceeds byte budget"); continue; }
+                    auto health = strata::core::sample_summary_host_health();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    auto admit = [&]() {
+                        const auto mem = strata::core::sample_host_memory();
+                        return strata::core::SummaryLimits::health_admits(health, strata::core::sample_summary_host_health()) &&
+                               strata::core::SummaryLimits::admits(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
+                                   bytes, uint64_t(o.conversation_cache_min_free_mib) << 20);
+                    };
+                    if (!admit()) { refuse_state("normal pressure, stable swap and RAM floor required"); continue; }
+                    strata::core::conversation_checkpoint_join(nullptr);
+                    strata::core::conversation_park_join();
+                    if (!ver.wait_commit(err)) { std::printf("FATAL state bank quiescence failed\n"); std::fflush(stdout); return 1; }
+                    // Allocate transaction identity before native publication; subsequent ownership swaps cannot allocate.
+                    std::string owned_id = txid;
+                    bool begun = false;
+                    try { begun = strata::metal_engine::window_summary_begin(ss, admit, err); }
+                    catch (...) { std::printf("FATAL uncertain summary bank transition\n"); std::fflush(stdout); return 1; }
+                    if (!begun) { refuse_state(err); continue; }
+                    summary_bank_live.swap(live); summary_bank_imgs.swap(live_imgs);
+                    summary_bank_live_ok = live_ok; live_ok = false;
+                    summary_bank_pristine = summary_pristine; summary_pristine = false;
+                    summary_img_rows.swap(img_rows); summary_row_ptr.swap(row_ptr);
+                    summary_mrope_identity = mrope_identity; mrope_identity = true;
+                    summary_has_embd_rows = sp.embd_rows != nullptr; sp.embd_rows = nullptr;
+                    summary_checks.swap(checks); std::swap(summary_conversations, conversations);
+                    std::swap(summary_kva_floors, kva_floors);
+                    summary_clock = check_clock; check_clock = 0;
+                    summary_tail = tail_ckpt_len; tail_ckpt_len = -1;
+                    summary_plan = seg_plan; seg_plan = {};
+                    summary_nf_prompt = nf_prompt_windows; nf_prompt_windows = false;
+                    summary_short_read = short_read_off_once; short_read_off_once = false;
+                    summary_cvec_cached = cvec_cached;
+                    o.prompt_cache = 0;
+                    summary_bank.id.swap(owned_id); ++summary_bank.epoch;
+                    continuation_summary_selected = true; summary_bank_nan = false;
+                    summary_bank.main_tokens = summary_bank_live.size(); summary_bank.allocated_bytes = bytes;
+                    std::fprintf(stderr, "strata summary state: held epoch %llu, main %llu tokens, slot %llu bytes, shared weights, serial compute\n",
+                        (unsigned long long)summary_bank.epoch, (unsigned long long)summary_bank.main_tokens, (unsigned long long)bytes);
+                } else {
+                    if (!summary_bank.active() || txid != summary_bank.id) {
+                        refuse_state("end requires active transaction identity"); continue;
+                    }
+                    if (continuations[1].active()) { refuse_state("summary continuation is still active"); continue; }
+                    // Host and device return to the latest main, not the BEGIN snapshot.
+                    try {
+                        if (!continuation_select(false, err) || !ver.wait_commit(err) ||
+                            !strata::metal_engine::window_summary_end(err)) {
+                            std::printf("FATAL summary bank release failed\n"); std::fflush(stdout); return 1;
+                        }
+                    } catch (...) { std::printf("FATAL uncertain summary bank release\n"); std::fflush(stdout); return 1; }
+                    summary_bank_live.clear(); summary_bank_imgs.clear(); summary_img_rows.clear(); summary_row_ptr.clear();
+                    summary_checks.clear(); summary_conversations = strata::core::ConversationCache(0, 0);
+                    summary_kva_floors.clear(); continuations[1] = {};
+                    summary_bank.main_tokens = live.size();
+                    o.prompt_cache = summary_prompt_cache;
+                }
+                std::printf("SUMMARY_STATE_%s %s %llu %llu %llu\n", state_begin ? "HELD" : "RELEASED", txid.c_str(),
+                    (unsigned long long)summary_bank.main_tokens, (unsigned long long)summary_bank.allocated_bytes,
+                    (unsigned long long)summary_bank.epoch);
+                if (state_end) summary_bank.id.clear();
+                std::fflush(stdout); continue;
+#else
+                refuse_state("state bank requires supported Metal configuration"); continue;
+#endif
+            }
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal
@@ -15469,9 +15863,20 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
-                const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+            const bool summary_begin = line.rfind("SUMMARY_BEGIN ", 0) == 0;
+            const bool summary_end = line.rfind("SUMMARY_END ", 0) == 0;
+            if (summary_begin || summary_end || line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+                const bool save = summary_begin || (!summary_end && line[0] == 'S');
+                std::string path = line.substr(summary_begin ? 14 : summary_end ? 12 : save ? 5 : 8);
+                strata::core::SummaryLimits summary_limits;
+                const bool summary_limits_ok = !summary_begin || summary_limits.parse(path);
+                // END temporarily restores configuration for the existing file reader. Any refusal keeps
+                // the transaction sealed, with checkpoint creation disabled, until END is retried.
+                struct SummaryCacheScope {
+                    int& value; const strata::core::SummaryTransaction& tx;
+                    ~SummaryCacheScope() { if (tx.active()) value = 0; }
+                } summary_cache_scope{o.prompt_cache, summary_tx};
+                if (summary_end) o.prompt_cache = summary_prompt_cache;
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -15505,6 +15910,50 @@ int main(int argc, char** argv) {
                 strata::core::conversation_checkpoint_join(nullptr);
                 strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
                 if (path.empty()) { refuse("missing path"); continue; }
+                if (!summary_limits_ok) { refuse("summary v3 needs positive token, snapshot-byte and protected-byte limits plus path"); continue; }
+                if (summary_begin && live.size() > summary_limits.tokens) {
+                    refuse("main session exceeds qualified summary token envelope"); continue;
+                }
+                if (summary_begin && (!summary_supported() || !summary_tx.can_begin(path) || nan_flush)) {
+                    refuse("summary transaction unavailable for this configuration or session"); continue;
+                }
+                if (summary_end && !summary_tx.can_end(path)) {
+                    refuse("summary end requires the active snapshot path"); continue;
+                }
+                if (summary_begin && !strata::core::SummaryLimits::shape_admits(
+                        live_imgs.size(), !img_rows.empty() || !row_ptr.empty() || sp.embd_rows != nullptr,
+                        !mrope_identity, checks.size(), conversations.size(), uint64_t(o.conversation_cache_slots))) {
+                    refuse("summary foreground shape unqualified: requires text-only, at most six checkpoints and four configured parked slots");
+                    continue;
+                }
+                if (summary_begin &&
+                    (!std::all_of(checks.begin(), checks.end(), [&](const auto& c) {
+                        return c.summary_text_shape(summary_limits.tokens);
+                    }) || !conversations.summary_text_shape(summary_limits.tokens, 6,
+                            size_t(std::min(o.conversation_cache_slots, 4))))) {
+                    refuse("summary protected cache shape unqualified: image, stage, unknown reuse provenance or token/checkpoint bound");
+                    continue;
+                }
+#if defined(__APPLE__)
+                if (summary_begin) {
+                    summary_health = strata::core::sample_summary_host_health();
+                    // Detect active swap churn before even writing a snapshot, including EMPTY.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (!strata::core::SummaryLimits::health_admits(summary_health, strata::core::sample_summary_host_health())) {
+                        refuse("summary requires known normal macOS memory pressure and stable swap",
+                               strata::core::SessionError::memory);
+                        continue;
+                    }
+                }
+                if (summary_end && !strata::core::SummaryLimits::health_admits(
+                        summary_health, strata::core::sample_summary_host_health())) {
+                    // END is recovery, not optional work. Keep the read allocation/floor admission
+                    // below, but do not reject merely on pressure or lose the held snapshot.
+                    std::fprintf(stderr, "strata summary: macOS pressure/swap worsened or unknown; "
+                                         "attempting rollback subject to RAM allocation admission\n");
+                }
+#endif
+                if (summary_end) summary_tx.begin_restore();
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
@@ -15512,6 +15961,139 @@ int main(int argc, char** argv) {
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                auto summary_admit = [&](size_t bytes, bool published) {
+                    // SAVE streams KV, whereas END parses a complete host image. Check the estimated
+                    // rollback budget BEFORE moving ownership or letting summary overwrite the live device.
+                    // Existing protected allocations are reflected in available memory already.
+                    // Their separate envelope prevents short-session tests qualifying larger caches.
+                    using Limits = strata::core::SummaryLimits;
+                    uint64_t retained = conversations.bytes();
+                    retained = Limits::add(retained, checks.capacity() * sizeof(ConvCheckpoint));
+                    for (const auto& check : checks) retained = Limits::add(retained, check.bytes());
+                    retained = Limits::add(retained, img_rows.capacity() * sizeof(float));
+                    retained = Limits::add(retained, row_ptr.capacity() * sizeof(const float*));
+                    retained = Limits::add(retained, summary_mrope.capacity() * sizeof(int32_t));
+                    // Conservative metadata allowance (cache directory, registry and small vectors).
+                    retained = Limits::add(retained, uint64_t(16) << 20);
+                    if (!summary_limits.covers(live.size(), bytes, retained)) {
+                        refuse("snapshot or protected state exceeds qualified summary byte envelope",
+                               strata::core::SessionError::memory, published);
+                        return false;
+                    }
+#if defined(__APPLE__)
+                    if (!Limits::health_admits(summary_health, strata::core::sample_summary_host_health())) {
+                        refuse("macOS pressure/swap worsened or unknown before summary hold",
+                               strata::core::SessionError::memory, published);
+                        return false;
+                    }
+#endif
+                    const uint64_t peak = bytes ? strata::core::session_read_peak_bytes(bytes) : 0;
+                    const auto mem = strata::core::sample_host_memory();
+                    const auto available = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                    const uint64_t floor = uint64_t(o.conversation_cache_min_free_mib) << 20;
+                    if (!Limits::admits(available, peak, floor)) {
+                        refuse("not enough RAM for complete summary rollback plus 1024 MiB scratch (" +
+                               std::to_string(Limits::rollback_need(peak) >> 20) + " MiB plus floor; " +
+                               ram_note(mem) + ")", strata::core::SessionError::memory, published);
+                        return false;
+                    }
+                    std::fprintf(stderr, "strata summary: admitted rollback read %llu bytes + scratch %llu; "
+                                         "protected %llu bytes, live %zu tokens, checkpoints %zu, parked %zu, "
+                                         "reuse %zu bytes (not a reservation)\n",
+                                 (unsigned long long) peak, (unsigned long long) Limits::scratch,
+                                 (unsigned long long) retained, live.size(), checks.size(), conversations.size(),
+                                 conversations.retained_bytes());
+                    return true;
+                };
+                auto summary_hold = [&](bool empty) {
+                    summary_img_rows.swap(img_rows);
+                    summary_row_ptr.swap(row_ptr);
+                    summary_mrope_identity = mrope_identity;
+                    summary_has_embd_rows = sp.embd_rows != nullptr;
+                    sp.embd_rows = nullptr;
+                    summary_checks.swap(checks);
+                    std::swap(summary_conversations, conversations);
+                    std::swap(summary_kva_floors, kva_floors);
+                    summary_clock = check_clock; check_clock = 0;
+                    summary_tail = tail_ckpt_len; tail_ckpt_len = -1;
+                    summary_plan = seg_plan; seg_plan = {};
+                    summary_nf_prompt = nf_prompt_windows; nf_prompt_windows = false;
+                    summary_short_read = short_read_off_once; short_read_off_once = false;
+                    live.clear(); live_imgs.clear(); live_ok = false;
+                    o.prompt_cache = 0;
+                    summary_cvec_cached = cvec_cached;
+                    summary_pristine = false;
+                    summary_tx.commit_begin(std::move(path), empty);
+                };
+                auto summary_release = [&]() {
+                    // The authoritative live device image is now restored. Only now expose the full
+                    // original cache chain and its bookkeeping; never on an SERR or failed transfer.
+                    // A text summary changed a vision main's position table to identity. Restore it
+                    // before publishing the original state; a failed GPU transfer is never recoverable
+                    // by continuing inference. The caller keeps any disk snapshot; EMPTY mode has no KV snapshot.
+                    if (!summary_mrope.empty() &&
+                        cudaMemcpy(d_mrope, summary_mrope.data(), summary_mrope.size() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        std::printf("FATAL restoring the summary M-RoPE table failed\n");
+                        std::fflush(stdout);
+                        return false;
+                    }
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        std::printf("FATAL synchronizing summary rollback failed\n");
+                        std::fflush(stdout);
+                        return false;
+                    }
+                    mrope_host.swap(summary_mrope); summary_mrope.clear();
+                    img_rows.swap(summary_img_rows); summary_img_rows.clear();
+                    row_ptr.swap(summary_row_ptr); summary_row_ptr.clear();
+                    mrope_identity = summary_mrope_identity;
+                    sp.embd_rows = summary_has_embd_rows ? row_ptr.data() : nullptr;
+                    checks.clear(); checks.swap(summary_checks);
+                    std::swap(conversations, summary_conversations);
+                    summary_conversations = strata::core::ConversationCache(0, 0);
+                    std::swap(kva_floors, summary_kva_floors);
+                    summary_kva_floors.clear();
+                    check_clock = summary_clock; tail_ckpt_len = summary_tail;
+                    seg_plan = summary_plan;
+                    nf_prompt_windows = summary_nf_prompt;
+                    short_read_off_once = summary_short_read;
+                    cvec_cached = summary_cvec_cached;
+                    if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(cvec_cached);
+                    summary_pristine = summary_tx.empty_mode();
+                    summary_tx.commit_end();
+                    return true;
+                };
+                const bool empty_begin = summary_begin && strata::core::SummaryTransaction::empty_eligible(
+                    summary_pristine, live_ok, live.size(), checks.size(), conversations.size(),
+                    conversations.retained_bytes(), live_imgs.size() + img_rows.size() + row_ptr.size(), nan_flush);
+                if (empty_begin) {
+                    // No valid main sequence has ever been attempted. No KV file is created; path remains
+                    // the exact transaction identity. A caller's existing empty placeholder is untouched.
+                    try { summary_mrope = mrope_host; }
+                    catch (const std::bad_alloc&) { refuse("not enough RAM to protect empty vision state", strata::core::SessionError::memory); continue; }
+                    if (!summary_admit(0, false)) continue;
+                    summary_hold(true);
+                    std::printf("SUMMARY_HELD 0 0 %.1f\n", ms());
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (summary_end && summary_tx.empty_mode()) {
+                    // session_zero restores the reference's logical empty recurrent/PLE state. Unused
+                    // KV bytes need not match; no prefix is reachable until a fresh request overwrites it.
+                    blocking("emptyreset", 0);
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        std::printf("FATAL quiescing empty summary rollback failed\n"); std::fflush(stdout); return 1;
+                    }
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+                        std::printf("FATAL resetting empty summary state failed\n"); std::fflush(stdout); return 1;
+                    }
+                    live.clear(); live_imgs.clear(); live_ok = false; nan_flush = false;
+                    if (!summary_release()) return 1;
+                    std::printf("SUMMARY_RELEASED 0 0 %.1f\n", ms());
+                    std::fflush(stdout);
+                    continue;
                 }
                 strata::core::SessionFileIdentity id;
                 try {
@@ -15547,13 +16129,15 @@ int main(int argc, char** argv) {
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
                             }
-                            sl.state_bytes = state;
+                            // Include the extra host M-RoPE copy in SAVE's conservative RAM admission.
+                            const uint64_t positions = summary_begin ? mrope_host.size() * sizeof(int32_t) : 0;
+                            sl.state_bytes = state <= UINT64_MAX - positions ? state + positions : UINT64_MAX;
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + (use_mtp ? 1 : 0);
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        if (o.session_save_reclaim) {
+                        if (o.session_save_reclaim && !summary_begin) {
                             const auto freed = strata::core::session_save_reclaim(
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
@@ -15583,12 +16167,13 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         kept = disk_checks.size();
+                        if (summary_begin) summary_mrope = mrope_host; // before publication; bad_alloc leaves main untouched
                         const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -15613,7 +16198,12 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
                                  "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
                                  path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    if (summary_begin) {
+                        if (!summary_admit(bytes, true)) continue;
+                        const size_t tokens = live.size();
+                        summary_hold(false);
+                        std::printf("SUMMARY_HELD %zu %zu %.1f\n", tokens, bytes, ms());
+                    } else std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -15634,7 +16224,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -15651,7 +16241,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, use_mtp ? &mtp.kv_state() : nullptr, err)) {
                         refuse(err);
                         continue;
                     }
@@ -15664,7 +16254,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, use_mtp ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -15691,7 +16281,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
-                    std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    if (summary_end) {
+                        if (!summary_release()) return 1;
+                        std::printf("SUMMARY_RELEASED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    } else std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
                 }
                 std::fflush(stdout);
                 continue;
@@ -15828,6 +16421,19 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (!prep.id.empty() && ((uint64_t)n + prep.limit + 8 > (uint64_t)o.max_context || n < 1 ||
+                req_penalty_last_n < 0 || req_penalty_last_n > kPenaltyWindowCap)) {
+                std::printf("ERR APREP full request exceeds context or penalty capacity\n"); continue;
+            }
+            if (summary_tx.active() || (summary_bank.active() && continuation_summary_selected)) {
+                if (geni || req_prefill_only || !strata::core::SummaryTransaction::bounded(n, max_new)) {
+                    std::printf("ERR summary needs text and prompt + output + 8 <= 16384\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                req_ckpt = false;
+                req_pin = 0;
+            }
             // --draft auto: this request's drafter.  Without the DFlash2 drafter loaded every request uses the MTP, as before.
             uint64_t bandit_key = 0;
             if (use_df2 && o.draft_auto) {
@@ -16518,7 +17124,12 @@ int main(int argc, char** argv) {
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
+                    const bool text_provenance = stages.empty() && live_imgs.empty() &&
+                        std::all_of(checks.begin(), checks.end(), [](const auto& c) {
+                            return c.summary_text_shape(UINT64_MAX);
+                        });
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live,
+                                         text_provenance);
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 lent_slot = -1;   // (the main session holds the parked conversation now)
@@ -19247,6 +19858,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (!prep.id.empty()) prep.last_token = outv[(size_t)i];
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;
@@ -19569,6 +20181,24 @@ int main(int argc, char** argv) {
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
             const int64_t fresh = n - resume;
             const int64_t read_n = cancelled ? std::clamp<int64_t>(pp_reached - resume, 0, fresh) : fresh;
+            if (!prep.id.empty()) {
+                prep.cursor = strata::core::NativeContinuation::preparation_cursor((size_t)n, pp_reached, resume, pp_exact);
+                prep.produced = (size_t)std::max<int64_t>(0, produced_n);
+                prep.status = cancelled || std::strcmp(finish, "cancel") == 0 ? "cancel" : "failed";
+                if (!cancelled && !nf_hit && produced_n == 1 && prep.last_token >= 0 &&
+                    live.size() == (size_t)n && (std::strcmp(finish, "length") == 0 || std::strcmp(finish, "stop") == 0)) {
+                    prep.cursor = live.size(); // successful shape proved above; never a stale outgoing conversation
+                    strata::core::NativeContinuation c;
+                    c.id = prep.id; c.origin = (size_t)n; c.cursor = live.size(); c.produced = 1; c.limit = prep.limit;
+                    c.ids = live; c.ids.push_back(prep.last_token);
+                    c.sampler = req_sp; c.sampler.counter = (uint64_t)c.cursor; c.sampler.logit_bias = nullptr;
+                    c.bias = req_bias; c.penalty_origin = pen_gen0; c.cache = req_ckpt != 0;
+                    c.logprobs = req_logprobs; c.allowed = req_allowed;
+                    c.done = std::strcmp(finish, "stop") == 0 || prep.limit == 1;
+                    prep.status = c.done ? (std::strcmp(finish, "stop") == 0 ? "stop" : "length") : "active";
+                    continuations[0] = std::move(c);
+                }
+            }
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
             //      [RAM blobs] [file blobs] [file MB]   (CS-T tiers; appended, so an older server reads the rest)
             //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)

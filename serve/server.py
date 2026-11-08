@@ -65,6 +65,8 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import atomic_summary, priority  # noqa: E402
+from serve.priority_client import ContinuationClient  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -1086,7 +1088,7 @@ class _RequestOwned:
 
     def _store(self, obj):
         d = obj.__dict__
-        if d.get("batch"):
+        if d.get("batch") or d.get("priority_client"):
             return d.setdefault("_own_tl", threading.local()).__dict__
         return d.setdefault("_own_plain", {})
 
@@ -1125,9 +1127,15 @@ class StrataEngine:
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
+    progress = priority.RequestValue()
+    progress_ms = priority.RequestValue()
+    reused = priority.RequestValue()
+    prefill_tok_s_mean = priority.RequestValue()
+    lp_lines = priority.RequestValue()
+
     @property
     def last(self):
-        if self.batch:
+        if self.batch or getattr(self, "priority_client", None):
             tl = self.__dict__.setdefault("_tl", threading.local())
             if not hasattr(tl, "last"):
                 tl.last = {}
@@ -1137,7 +1145,7 @@ class StrataEngine:
     @last.setter
     def last(self, value):
         self.__dict__["_last"] = value
-        if self.batch:
+        if self.batch or getattr(self, "priority_client", None):
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
@@ -2746,6 +2754,9 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if getattr(self, "priority_client", None) is not None:
+            yield from self.priority_client.generate(ids, max_new, sampling, cancel, embeddings, prefill_only)
+            return
         bias_api.validate_request(sampling or {}, self, None)
         refuse_for_split(self, sampling or {})
         if getattr(self, "batch", 0) and not self.multi:
@@ -2991,11 +3002,78 @@ class StrataEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
 
-    def session_file(self, action: str, path: str) -> dict:
+    def summary_state(self, action, txid=None, *, max_slot_bytes=None):
+        """Protocol4 only. No path, disk fallback or inferred native support."""
+        if action not in ("caps", "begin", "end"):
+            raise ValueError("invalid state-bank action")
+        if action != "caps" and (not isinstance(txid, str) or re.fullmatch(r"[A-Za-z0-9]{1,64}", txid) is None):
+            raise ValueError("invalid state-bank transaction identity")
+        if action == "begin" and (type(max_slot_bytes) is not int or not 0 < max_slot_bytes <= 9007199254740991):
+            raise ValueError("invalid state-bank budget")
+        command = "SUMMARY_STATE_" + action.upper()
+        if action == "begin": command += f" {max_slot_bytes} {txid}"
+        elif action == "end": command += f" {txid}"
         with self._exclusive_control():
-            return self._session_file(action, path)
+            self.proc.stdin.write(command + "\n")
+            self.proc.stdin.flush()
+            deadline = time.monotonic() + max(10, float(self.silence_s or 0))
+            while True:
+                try:
+                    line = self.lines.get(timeout=max(0.001, deadline - time.monotonic()))
+                except queue.Empty:
+                    raise EngineDied("state-bank acknowledgment timed out") from None
+                if line is None:
+                    raise EngineDied("engine ended during state-bank control")
+                if line.startswith(("INFO ", "WARN ")) and time.monotonic() < deadline:
+                    continue
+                fields = line.split()
+                if action == "caps":
+                    if fields != ["SUMMARY_STATE_CAPS", "4", "16384"]:
+                        raise ValueError("engine lacks state-bank protocol4")
+                    return True
+                if fields[:1] == ["SUMMARY_STATE_REFUSED"] and action == "begin" and len(fields) >= 3 and fields[1] == txid:
+                    refusal = SessionRefused("refused", " ".join(fields[2:]), False)
+                    refusal.summary_refused = True
+                    raise refusal
+                expected = "SUMMARY_STATE_HELD" if action == "begin" else "SUMMARY_STATE_RELEASED"
+                if len(fields) != 5 or fields[0] != expected or fields[1] != txid:
+                    raise EngineDied("invalid state-bank acknowledgment; state uncertain")
+                values = fields[2:]
+                if any(len(v) > 20 or re.fullmatch(r"0|[1-9][0-9]*", v) is None for v in values):
+                    raise EngineDied("invalid state-bank numeric identity")
+                tokens, allocated, epoch = map(int, values)
+                if tokens > getattr(self, "max_context", 0) or allocated <= 0 or allocated > 9007199254740991 or not 0 < epoch <= 18446744073709551615:
+                    raise EngineDied("invalid state-bank identity bounds")
+                if action == "begin" and allocated > max_slot_bytes:
+                    raise EngineDied("state-bank allocation exceeded budget")
+                return {"transaction_id": txid, "main_tokens": tokens, "allocated_bytes": allocated, "epoch": values[2]}
 
-    def _session_file(self, action: str, path: str) -> dict:
+    def summary_control(self, action):
+        """Positive native discovery, never inferred from a Python method existing."""
+        if action != "caps":
+            raise ValueError("invalid summary control")
+        with self._exclusive_control():
+            self.proc.stdin.write("SUMMARY_CAPS\n")
+            self.proc.stdin.flush()
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    line = self.lines.get(timeout=max(0.001, deadline - time.monotonic()))
+                except queue.Empty:
+                    raise EngineDied("summary protocol discovery timed out") from None
+                if line is None:
+                    raise EngineDied("engine ended during summary protocol discovery")
+                if line.startswith(("INFO ", "WARN ")) and time.monotonic() < deadline:
+                    continue
+                if line.strip() != "SUMMARY_CAPS 3 16384":
+                    raise ValueError("engine does not support qualified serial summary transactions")
+                return True
+
+    def session_file(self, action: str, path: str, *, summary_envelope=None) -> dict:
+        with self._exclusive_control():
+            return self._session_file(action, path, summary_envelope=summary_envelope)
+
+    def _session_file(self, action: str, path: str, *, summary_envelope=None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -3007,16 +3085,23 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        commands = {"save": ("SAVE", "SAVED"), "restore": ("RESTORE", "RESTORED"),
+                    "summary_begin": ("SUMMARY_BEGIN", "SUMMARY_HELD"),
+                    "summary_end": ("SUMMARY_END", "SUMMARY_RELEASED")}
+        if action not in commands or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        command = commands[action][0]
+        if action == "summary_begin":
+            envelope = atomic_summary.validate_envelope(summary_envelope)
+            command += " " + " ".join(str(envelope[key]) for key in atomic_summary.ENVELOPE_KEYS)
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{command} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = commands[action][1]
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -3078,7 +3163,9 @@ class StrataEngine:
                 parts = line.rstrip("\r\n").split(" ", 3)
                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
                     raise out_of_step(line)
-                raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+                refusal = SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+                refusal.summary_refused = action == "summary_begin"  # v3 SERR always precedes hold/live mutation
+                raise refusal
             if head == want:
                 try:
                     if len(f) != 4:
@@ -4798,6 +4885,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.summary_lane = atomic_summary.SummaryLane()
+        self.atomic_model_fingerprint = None
+        self.atomic_completion_review_qualified = False
+        self.summary_switch_draining = False
+        self.summary_recovery_stop_ready = False
+        self.atomic_owner_key = None
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4991,9 +5084,56 @@ class Service:
         finally:
             self.fifo.release()
 
+    def summary_switch_cancel(self, suspend=False, drain=False):
+        # Hold the same lock as reserve_inference: no foreground can slip
+        # between this check and closing admission. Never cancel foreground.
+        with self.status_lock:
+            state = self.summary_lane.status()
+            if drain:
+                if self.draining and not self.summary_switch_draining:
+                    raise atomic_summary.SummaryError("server is already draining", 409, "server_draining")
+                summary_owned = int(state["pending"])
+                if state["foreground_requests"] or self.admission_reserved > summary_owned:
+                    raise atomic_summary.SummaryError("foreground work is admitted; engine switch refused", 409,
+                                                       "foreground_busy")
+                if state["recovery_required"]:
+                    # This is disposal, never recovery or permission to reuse native
+                    # state. Close admission only after all host request owners have
+                    # left. The controller must wait for the process tree to exit
+                    # before starting another engine; uncertain native work dies
+                    # with that process and is never resumed.
+                    if (state["pending"] or state["active"] or self.admission_reserved
+                            or self.live_reqs or self.status.get("busy") or self.status.get("queued")):
+                        raise atomic_summary.SummaryError("recovery work is still active; engine stop refused", 409,
+                                                           "foreground_busy")
+                    scheduler = self.summary_lane.scheduler
+                    if scheduler is not None:
+                        with scheduler.cv:
+                            if (scheduler.turn_owner is not None or any(scheduler.owners.values())
+                                    or any(scheduler.waiters.values())):
+                                raise atomic_summary.SummaryError("native owner is still active; engine stop refused", 409,
+                                                                   "foreground_busy")
+                    self.summary_recovery_stop_ready = True
+                self.draining = self.summary_switch_draining = True
+                self.admission_changed.notify_all()
+            result = self.summary_lane.cancel_summary(suspend or drain)
+            result["inference_draining"] = self.summary_switch_draining
+            result["recovery_stop_ready"] = self.summary_recovery_stop_ready
+            return result
+
+    def summary_switch_resume(self):
+        with self.status_lock:
+            result = self.summary_lane.resume_summaries()
+            if self.summary_switch_draining:
+                self.draining = self.summary_switch_draining = False
+                self.admission_changed.notify_all()
+            result["inference_draining"] = self.summary_switch_draining
+            return result
+
     def begin_drain(self) -> int:
         """Stop new inference admission and return the number of owned calls to drain."""
         with self.admission_changed:
+            self.summary_switch_draining = False  # shutdown now owns the drain; a UI resume cannot undo it
             self.draining = True
             self.admission_changed.notify_all()
             return self.admission_reserved
@@ -5025,6 +5165,8 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
+        if self.summary_lane.scheduler is not None:
+            return error(501, "slot save/restore is unavailable with weighted continuations")
         if getattr(self.engine, "batch", 0):
             # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
             # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
@@ -5302,8 +5444,15 @@ class Service:
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        # A restart cannot recover an uncertain bank identity. Block load hooks,
+        # image-preparation loads and explicit /load as well as normal inference.
+        self.summary_lane.check_healthy()
         if self.loaded() and not self._vision_down():
             return
+        if self.summary_lane.scheduler is not None:
+            self.summary_lane.scheduler.poison("engine or vision process changed")
+            raise atomic_summary.SummaryError("priority runtime must be restarted after a process change",
+                                              code="atomic_summary_recovery_required")
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -5398,6 +5547,8 @@ class Service:
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
+        if self.summary_lane.scheduler is not None:
+            raise ValueError("VRAM resize is unavailable with weighted continuations")
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
@@ -5475,7 +5626,7 @@ class Service:
         right after the lost one is never killed by it. A server with batch slots shares the engine between requests, so it is left alone. True when
         the engine was ended (the next request then starts it again)."""
         end = getattr(self.engine, "end_for_restart", None)
-        if end is None or born is None or batch_slots_on(self.engine):
+        if end is None or born is None or batch_slots_on(self.engine) or self.summary_lane.scheduler is not None:
             return False
         if not self.fifo.acquire(blocking=False):              # the next request is already generating on it
             return False
@@ -5500,7 +5651,10 @@ class Service:
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
         with idle_for: one ran more recently than that) or "unsupported"."""
-        if not hasattr(self.engine, "unload"):
+        if not hasattr(self.engine, "unload") or self.summary_lane.scheduler is not None:
+            # Native ownership is process-bound. The application's existing
+            # drain/shutdown path may stop this process; idle reload is not part
+            # of the experimental continuation contract.
             return "unsupported"
         if not self.fifo.acquire(blocking=False):
             return "busy"
@@ -5764,6 +5918,7 @@ class Service:
             s, totals = dict(self.status), dict(self.totals)
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
             running = len(self.live_reqs) if self.live_reqs else int(bool(s.get("busy")))
+            inference_reserved = self.admission_reserved
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
         hw, static = tel.get("now") or {}, tel.get("static") or {}
 
@@ -5774,6 +5929,10 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
+            "runtime_id": self.instance_id, "atomic_summary": {**self.summary_lane.status(),
+                "inference_draining": self.summary_switch_draining,
+                "recovery_stop_ready": self.summary_recovery_stop_ready},
+            "atomic_inference_reserved": inference_reserved,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
@@ -5839,6 +5998,8 @@ class Service:
     def _turn(self, cancel=None):
         """The engine's single turn (self.fifo) for an image encode.  #1999: a client that leaves while this request
         waits for it gives its place up (ClientGone), as a queued generation does (#1619)."""
+        if self.summary_lane.scheduler is not None and getattr(self.vision, "elastic", False):
+            raise ValueError("elastic image encoding is unavailable with weighted continuations")
         if cancel is None:
             self.fifo.acquire()
         else:
@@ -5914,7 +6075,8 @@ class Service:
                     else:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs,
+            store=not (req is not None and req.get("atomic_summary") is True))
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -5988,6 +6150,18 @@ class Service:
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        if req is not None and req.get("atomic_summary") is True:
+            ctx = min(ctx, atomic_summary.CONTEXT)
+            if len(ids) + max_new + CTX_SLACK > ctx:
+                raise ValueError(f"Prompt has {len(ids)} tokens plus {max_new + CTX_SLACK} reserved output tokens; "
+                                 f"summary context limit is {ctx}; requests are never truncated")
+        reserve = req.get("atomic_output_reserve") if req is not None else None
+        if reserve is not None:
+            if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0 or reserve > ctx:
+                raise ValueError("atomic_output_reserve must be a nonnegative integer within the context")
+            if len(ids) + reserve + CTX_SLACK > ctx:
+                raise ValueError(f"Prompt has {len(ids)} tokens plus {reserve + CTX_SLACK} reserved output tokens; "
+                                 f"context limit is {ctx}; requests are never truncated")
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
@@ -6206,7 +6380,62 @@ class Service:
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
+            with self.summary_lane.register(sampling.get("atomic_summary") is True, cancel):
+                scheduler = self.summary_lane.scheduler
+                if scheduler is None:
+                    yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
+                else:
+                    deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
+                    admission = scheduler.admit(sampling.get("atomic_summary") is True, cancel, deadline)
+                    waiting_id = uuid.uuid4().hex[:12]
+                    admitted = False
+                    cancel._priority_queued_at = time.time()
+                    cancel._strata_request_id = waiting_id
+                    cancel._priority_request_id = waiting_id
+                    with self.status_lock:
+                        self.status["queued"] += 1
+                        self.terminal_requests[waiting_id] = {"id": waiting_id, "state": "queued",
+                            "queued_at": cancel._priority_queued_at, "admitted_at": None, "prompt_tokens": len(ids)}
+                        self._terminal_event_locked(waiting_id, "queued")
+                    try:
+                        while True:
+                            try:
+                                next(admission)
+                                yield "ping", None
+                            except StopIteration as result:
+                                owner = result.value
+                                admitted = True
+                                break
+                    except priority.PriorityCancelled:
+                        with self.status_lock:
+                            self._terminal_event_locked(waiting_id, "cancelled", "cancel")
+                        yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0,
+                                       "timings": None, "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                        return
+                    except GeneratorExit:
+                        with self.status_lock:
+                            self._terminal_event_locked(waiting_id, "disconnected", "disconnect")
+                        raise
+                    except TimeoutError:
+                        with self.status_lock:
+                            self.queue_timeouts += 1
+                            self._terminal_event_locked(waiting_id, "timeout", "timeout")
+                        raise QueueWaitExpired("priority lane queue deadline expired") from None
+                    finally:
+                        admission.close()
+                        with self.status_lock:
+                            self.status["queued"] -= 1
+                            if not admitted:
+                                self.terminal_requests.pop(waiting_id, None)
+                    cancel._priority_owner = owner
+                    try:
+                        with priority.observation(self.engine):
+                            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
+                    finally:
+                        scheduler.close(owner)
+                        with self.status_lock:
+                            self.terminal_requests.pop(waiting_id, None)
+                        del cancel._priority_owner
         finally:
             if ka is not None:
                 ka.release()
@@ -6301,10 +6530,11 @@ class Service:
         first_engine_token_s = None  # this request, from entering the engine queue; includes queue/prefill
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        par = bool(getattr(self.engine, "batch", 0))
+        cooperative = self.summary_lane.scheduler is not None
+        par = bool(getattr(self.engine, "batch", 0)) or cooperative
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
-        request_id = uuid.uuid4().hex[:12]
+        request_id = getattr(cancel, "_priority_request_id", None) or uuid.uuid4().hex[:12]
         setattr(cancel, "_strata_request_id", request_id)
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
@@ -6324,10 +6554,12 @@ class Service:
         setattr(cancel, "_strata_replica_selected", replica_selected)
         with self.status_lock:
             self.status["queued"] += 1
+            had_queue_row = request_id in self.terminal_requests
             self.terminal_requests[request_id] = {"id": request_id, "state": "queued",
-                                                    "queued_at": time.time(), "admitted_at": None,
+                                                    "queued_at": getattr(cancel, "_priority_queued_at", time.time()), "admitted_at": None,
                                                     "prompt_tokens": len(ids)}
-            self._terminal_event_locked(request_id, "queued")
+            if not had_queue_row:
+                self._terminal_event_locked(request_id, "queued")
         queued_counted = True
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
@@ -6356,6 +6588,7 @@ class Service:
                         yield "ping", None
             with turn:
                 try:
+                    self.summary_lane.check_healthy()
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
@@ -6389,6 +6622,10 @@ class Service:
                             self.status.update(st)
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
+                    if sampling.get("atomic_summary") is True:
+                        if (par and not cooperative) or thinking or tools or len(ids) + max_new + CTX_SLACK > atomic_summary.CONTEXT:
+                            raise ValueError("summary requires isolated text-only 16K context and thinking disabled")
+                        turn.enter_context(self.summary_lane.transaction(self.engine, cancel))
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -6515,6 +6752,8 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if nonfinite and sampling.get("atomic_summary") is True:
+                            raise EngineNonFinite("summary output became non-finite; restoring the main session")
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -6764,7 +7003,8 @@ class Service:
             rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
-        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+        done = {"finish": finish, "completion_tokens": n,
+                "reused": (timings or {}).get("cache_n", request_stats(segments).get("reused", 0)),
                 "timings": timings, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
@@ -8147,6 +8387,8 @@ def make_handler(svc: Service):
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
+                             "context_length": svc.reported_ctx(), "runtime_id": svc.instance_id,
+                             "family": svc.model_arch,
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
@@ -8159,7 +8401,33 @@ def make_handler(svc: Service):
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
-                    self._json(200, {"object": "list", "data": data})
+                    self._json(200, {"object": "list", "data": data,
+                                     "runtime_id": svc.instance_id, "atomic_runtime_id": svc.instance_id,
+                                     "atomic_model_fingerprint": svc.atomic_model_fingerprint,
+                                     "atomic_summary_slot": svc.summary_lane.enabled and not svc.summary_lane.poisoned,
+                                     "atomic_summary_context": atomic_summary.CONTEXT,
+                                     "atomic_summary_protocol": 5 if svc.summary_lane.scheduler else 4 if svc.summary_lane.mode == "state-bank-v1" else 3,
+                                     "atomic_summary_scheduler": svc.summary_lane.scheduler.status() if svc.summary_lane.scheduler else None,
+                                     "atomic_summary_continuation_text_only": False if svc.summary_lane.scheduler else None,
+                                     "atomic_summary_foreground_preparation": "legacy-first-token-v1" if svc.summary_lane.scheduler else None,
+                                     "atomic_summary_foreground_prefill_exclusive": True if svc.summary_lane.scheduler else None,
+                                     "atomic_summary_cold_start": (svc.summary_lane.enabled
+                                         and not svc.summary_lane.poisoned and svc.summary_lane.mode != "state-bank-v1"),
+                                     "atomic_summary_token_count": True,
+                                     "atomic_summary_qualified_envelope": (dict(svc.summary_lane.envelope)
+                                         if svc.summary_lane.enabled and not svc.summary_lane.poisoned and svc.summary_lane.envelope else None),
+                                     "atomic_summary_state_bank_max_bytes": svc.summary_lane.max_slot_bytes,
+                                     "atomic_summary_shared_weights": svc.summary_lane.mode == "state-bank-v1",
+                                     "atomic_summary_serialized_compute": svc.summary_lane.mode == "state-bank-v1",
+                                     "atomic_summary_experimental": svc.summary_lane.mode == "state-bank-v1",
+                                     "atomic_summary_state_bank_provenance": "experimental-user-validation" if svc.summary_lane.mode == "state-bank-v1" else None,
+                                     "atomic_summary_requires_foreground_warmup": svc.summary_lane.mode == "state-bank-v1",
+                                     "atomic_summary_scratch_reserve_bytes": atomic_summary.SCRATCH_RESERVE_BYTES,
+                                     "atomic_summary_isolation": (("shared-weights-priority-v1" if svc.summary_lane.scheduler else "shared-weights-state-bank-v1" if svc.summary_lane.mode == "state-bank-v1" else "serial-snapshot-v1") if svc.summary_lane.enabled else None),
+                                     "atomic_tool_preamble": 0,
+                                     "atomic_completion_review": (svc.atomic_completion_review_qualified is True
+                                         and svc.summary_lane.mode != "state-bank-v1" and svc.summary_lane.enabled and not svc.summary_lane.poisoned),
+                                     "atomic_tool_policy": "plain-system-v1"})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -8229,6 +8497,8 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
+                except atomic_summary.SummaryError as e:
+                    self._json(e.status, {"error": {"type": "server_error", "code": e.code, "message": str(e)}})
                 except GpuBusy as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
@@ -8255,6 +8525,10 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    svc.summary_lane.check_healthy()
+                    if req.get("atomic_summary") is not True:
+                        svc.summary_lane.foreground_arrived()
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -8313,12 +8587,27 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/atomic/summary-cancel":
+                    if not self._atomic_owner():
+                        return
+                    suspend, drain = req.get("suspend", False), req.get("drain", False)
+                    if not isinstance(suspend, bool) or not isinstance(drain, bool):
+                        raise ValueError("suspend and drain must be booleans")
+                    self._json(200, {"atomic_summary": svc.summary_switch_cancel(suspend, drain)})
+                elif path == "/v1/atomic/summary-resume":
+                    if not self._atomic_owner():
+                        return
+                    self._json(200, {"atomic_summary": svc.summary_switch_resume()})
+                elif path == "/v1/atomic/summary-token-count":
+                    self._summary_count_tokens(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except atomic_summary.SummaryError as e:
+                self._json(e.status, {"error": {"type": "server_error", "code": e.code, "message": str(e)}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -8471,6 +8760,18 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
 
+        def _atomic_owner(self):
+            # The launch secret never enters config, telemetry or renderer state.
+            # API keys alone cannot stop/suspend another local owner's engine.
+            expected = svc.atomic_owner_key
+            supplied = self.headers.get("X-Atomic-Owner-Key", "")
+            if (self.client_address[0] not in ("127.0.0.1", "::1") or not expected or
+                    not hmac.compare_digest(expected.encode(), supplied.encode())):
+                self._json(403, {"error": {"type": "permission_error", "code": "owner_required",
+                                          "message": "private managed-engine ownership proof required"}})
+                return False
+            return self._own_page("summary scheduling can be changed")
+
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
             server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
@@ -8615,7 +8916,14 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
-            req = svc.with_shared(req, "openai")
+            if "atomic_summary" in req and not isinstance(req["atomic_summary"], bool):
+                raise ValueError("atomic_summary must be a boolean")
+            if req.get("atomic_summary") is True:
+                req = atomic_summary.request(req)
+                if not svc.summary_lane.enabled:
+                    raise atomic_summary.SummaryError("isolated summary transactions are not enabled", 501)
+            else:
+                req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
@@ -8688,6 +8996,11 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 svc.note_client_disconnect(cancel)           # client went away: stop the engine
                 chunks.close()
+            except atomic_summary.SummaryError as e:
+                err = {"error": {"type": "server_error", "code": e.code, "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": died_note(e)}}
                 self._note(error=err["error"])
@@ -8877,6 +9190,17 @@ def make_handler(svc: Service):
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
+
+        def _summary_count_tokens(self, req):
+            req = atomic_summary.request(req, count=True)
+            if req.get("model") not in (None, *svc.model_names()):
+                raise ValueError("model not found")
+            messages, tools, kw = openai_to_messages(req)
+            require_messages(messages)
+            # Same rendering/tokenizer as generation, but no engine load/admission,
+            # image handling, cache mutation, or context truncation.
+            ids = svc.encode_prompt(messages, tools, kw, store=False)
+            self._json(200, {"input_tokens": len(ids), "context_length": atomic_summary.CONTEXT})
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
@@ -9481,6 +9805,32 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 SPLIT_KEYS = ("split_fallback", "split_engine_note")
 
 
+
+def prepare_summary_qualification_pins(raw_cfg, *, offline=False, batch_telemetry=None):
+    """Read-only expected-launch pin calculation. Does not start any engine.
+
+    Invoke under the same launch environment. A fallback/retry not represented
+    by this intended spawn is rejected by the post-start optional-feature gate.
+    Current qualification supports effort at start only; never guess token IDs.
+    """
+    import copy
+    from types import SimpleNamespace
+    cfg = copy.deepcopy(raw_cfg)
+    split_joined_args(cfg)
+    cfg = apply_vision_defaults(with_component_engine(apply_saved_tuning(cfg)))
+    if cfg.get("effort_position", "start") != "start":
+        raise ValueError("prelaunch summary pins require explicitly qualified effort_position=start")
+    if engine_component.is_reference(cfg["exe"]):
+        exe = _component_exe(cfg["exe"], cfg)
+    else:
+        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+    env = child_env(cfg, offline=offline)
+    configure_batch_telemetry_env(env, cfg, batch_telemetry)
+    args = engine_args(cfg, exe, announce=False)
+    expected = SimpleNamespace(spawn=(exe, args, cfg.get("cwd"), cfg.get("log"), env))
+    return atomic_summary.qualified_runtime_pins(atomic_summary.runtime_qualification_config(cfg, expected))
+
+
 def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, env: dict, lazy: bool, tok, *, offline: bool = False,
                              batch_telemetry=None):
     """Start the run config's engine. A config written for the all-cards split engine (strata_control/split_engine.py) carries the
@@ -10028,6 +10378,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
+    # Optional summary validation is nonfatal and performed after config resolution.
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:
@@ -10249,6 +10600,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    svc.atomic_owner_key = attestation_key if a.owner_fd is not None else None
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
@@ -10273,6 +10625,38 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                         pass
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
+    if a.engine == "strata":
+        try:
+            svc.atomic_model_fingerprint = atomic_summary.model_fingerprint(atomic_summary.runtime_qualification_config(cfg, svc.engine))
+        except (OSError, ValueError, TypeError):
+            # No stable archive scope is safer than silently trusting an alias.
+            svc.atomic_model_fingerprint = None
+    # Completion review is independent of automatic-compaction preferences,
+    # but uses the same proven isolated lane. Neither flag enables the other.
+    svc.atomic_completion_review_qualified = cfg.get("atomic_completion_review_qualified") is True
+    if a.engine == "strata":
+        summary_enabled = atomic_summary.configure_optional_lane(
+            svc.summary_lane, svc.engine, cfg,
+            engine_name=a.engine, arch=svc.model_arch, groups=groups)
+        if cfg.get("atomic_summary_scheduler") is not None:
+            try:
+                if not summary_enabled or svc.summary_lane.mode != "state-bank-v1" or cfg["atomic_summary_scheduler"] != "weighted-quanta-v1":
+                    raise ValueError("unsupported priority summary configuration")
+                scheduler = priority.WeightedScheduler(svc.fifo, cfg.get("atomic_summary_foreground_weight", 8))
+                client = ContinuationClient(svc.engine, scheduler, svc.summary_lane)
+                client.discover()
+                svc.summary_lane.scheduler = scheduler
+                svc.engine.priority_client = client
+            except Exception as exc:
+                # Never fall back to cancel/restart semantics under a request
+                # for resumable priority scheduling.
+                summary_enabled = svc.summary_lane.enabled = False
+                svc.summary_lane.disabled_reason = "priority_protocol_unavailable: " + type(exc).__name__
+        if (cfg.get("atomic_summary_transaction_qualified") is True or cfg.get("atomic_summary_state_bank_enabled") is True) and not summary_enabled:
+            svc.atomic_completion_review_qualified = False
+            print("[strata] optional summaries disabled: " + str(svc.summary_lane.disabled_reason), flush=True)
+    else:
+        svc.atomic_completion_review_qualified = False
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images

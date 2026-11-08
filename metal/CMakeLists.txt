@@ -126,6 +126,22 @@ target_compile_definitions(strata_metal_kernels PRIVATE
   STRATA_METAL_DATA_DEFAULT="${STRATA_ROOT}/data")
 target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
+# Small disk-session regression fixtures. CPU mode links only host transfer mocks;
+# GPU mode uses real Metal allocations/copies, but generic checkpoint code and no model.
+# Neither target is part of the default build; GPU execution is explicitly manual.
+set(SUMMARY_DISK_TEST_SOURCES ${S}/core/summary_disk_cpu_test.cpp
+    ${S}/core/test_support/summary_cpu_runtime.cpp ${S}/core/conversation_state.cpp
+    ${S}/core/conversation_snapshot.cpp ${S}/core/conversation_file.cpp)
+foreach(t summary_disk_cpu_test summary_disk_gpu_test)
+  add_executable(${t} EXCLUDE_FROM_ALL ${SUMMARY_DISK_TEST_SOURCES})
+  target_include_directories(${t} PRIVATE ${S}/core/test_support
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/metal_compat ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include ${S}/core)
+  target_compile_options(${t} PRIVATE -USTRATA_GPU_METAL -ffunction-sections -fdata-sections)
+  target_link_options(${t} PRIVATE -Wl,-dead_strip)
+endforeach()
+target_compile_definitions(summary_disk_gpu_test PRIVATE SUMMARY_DISK_TEST_GPU=1)
+target_link_libraries(summary_disk_gpu_test PRIVATE strata_gpu_metal)
+
 add_executable(strata ${S}/program/generate.cpp)
 target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
 

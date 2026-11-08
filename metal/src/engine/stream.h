@@ -68,6 +68,9 @@ public:
     // slots while a prompt runs and gives them back after
     uint8_t* region(uint64_t bytes);
     void hold_region(bool hold);
+    // Called only after the GPU handshake/command buffer completed. Weight-only I/O
+    // may finish, but an active prompt scratch loan must never cross a bank boundary.
+    bool quiesce(std::string& err);
     void report(FILE* f) const;
     void reset_stats();
 
@@ -105,6 +108,7 @@ private:
     std::vector<int> region_slots_;
     uint8_t* region_ = nullptr;
     uint64_t region_bytes_ = 0;
+    bool region_held_ = false; // guarded by mu_; includes standalone prompt scratch
     std::vector<uint32_t> code_;      // slot -> its smap value (chunk << 28 | page)
     std::vector<uint8_t*> host_;      // slot -> its CPU address
     mtl::Buffer smap_;

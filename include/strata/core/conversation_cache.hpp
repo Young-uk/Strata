@@ -47,6 +47,10 @@ struct ConversationCheckpoint {
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
 
+    // Summary qualification is narrower than general cache compatibility.
+    bool summary_text_shape(uint64_t max_tokens) const {
+        return imgs.empty() && stage_parts.empty() && ids.size() <= max_tokens;
+    }
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
                gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
@@ -84,6 +88,7 @@ struct ConversationKvReuse {
     // The conversation the image was captured from (the first stage's only): a park reuses it only for the prefix it
     // shares with the conversation then in the main session (a batch slot may have replaced that session's K/V since).
     std::vector<int32_t> ids;
+    bool summary_text_only = false; // explicit provenance; unknown is not qualified
     size_t bytes() const {
         size_t n = kv.capacity() * sizeof(ConversationKv) + stages.capacity() * sizeof(ConversationKvReuse) +
                    ids.capacity() * sizeof(int32_t);
@@ -269,9 +274,11 @@ public:
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
     // `ids`: the conversation the K/V belongs to (take_reuse_for refuses it for any other; none: never reused).
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, std::vector<int32_t> ids = {}) {
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, std::vector<int32_t> ids = {},
+                bool summary_text_only = false) {
         reuse_ = {};
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}, std::move(ids)};
+        candidate.summary_text_only = summary_text_only;
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}, {}});
         if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
     }
@@ -294,6 +301,20 @@ public:
         for (auto& st : r.stages) st.unchanged_tokens = std::min(st.unchanged_tokens, same);
         if (r.unchanged_tokens <= 0) return {};
         return r;
+    }
+    // Read-only: never evict or consume cache state just to admit optional summary work.
+    bool summary_text_shape(uint64_t max_tokens, size_t max_checkpoints, size_t max_parked) const {
+        if (!max_tokens || entries_.size() > max_parked) return false;
+        for (const auto& e : entries_) {
+            if (!e.stage_images.empty() || !e.live.summary_text_shape(max_tokens) ||
+                e.checkpoints.size() > max_checkpoints) return false;
+            for (const auto& c : e.checkpoints) if (!c.summary_text_shape(max_tokens)) return false;
+        }
+        if (reuse_.bytes() && (!reuse_.summary_text_only || !reuse_.stages.empty() ||
+            reuse_.captured_tokens < 0 || uint64_t(reuse_.captured_tokens) > max_tokens ||
+            reuse_.unchanged_tokens < 0 || reuse_.unchanged_tokens > reuse_.captured_tokens ||
+            reuse_.ids.size() != uint64_t(reuse_.captured_tokens))) return false;
+        return true;
     }
     size_t retained_bytes() const { return reuse_.bytes(); }
     int64_t retained_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }

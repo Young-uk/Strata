@@ -61,7 +61,7 @@ bool Window::pc_setup(int C) {
     b.v3e = b.k4 && T("blk.0.ffn_gate_exps.weight").type < 144;   // the trellis experts have the v2 kernels only
     b.C = C;
     const size_t MT = (size_t) C;
-    const int MB = (int) max_cells_ / 4 + 2;
+    const int MB = (int) allocation_max_cells_ / 4 + 2;
     // the expert GEMM tiles (prompt_chain's defaults): v3 gate/up 16,32,32,4 and down 16,64,32,2 with the M5 layout, else v2.
     // STRATA_PROMPT_GU / STRATA_PROMPT_DN = TM,TN,TK,SG override them (test tooling; TM = the plan's tile height, the same for both)
     b.gu3[0] = 16; b.gu3[1] = 32; b.gu3[2] = 32; b.gu3[3] = 4;

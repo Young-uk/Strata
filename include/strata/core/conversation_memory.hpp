@@ -62,6 +62,15 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
 /// The real files (Windows: GlobalMemoryStatusEx) and the cap set by set_memory_limit_bytes().
 std::optional<HostMemoryReading> sample_host_memory();
 
+// macOS summary-only admission signals. Unknown telemetry must refuse new work;
+// restoration uses allocation admission independently so pressure cannot strand a snapshot.
+struct SummaryHostHealth {
+    uint32_t pressure = 0;  // Darwin normal=1, warning=2, critical=4; other values fail closed
+    uint64_t swap_used = 0;
+    uint64_t swapouts = 0;  // cumulative pages; detects churn even if swap usage falls
+};
+std::optional<SummaryHostHealth> sample_summary_host_health();
+
 std::optional<uint64_t> available_host_bytes();
 
 /// #3493: the conversation cache budget (MiB) --serve uses when --conversation-cache-mib was not given, from the RAM that is available

@@ -24,6 +24,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/summary_state_bank.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/sampler.hpp"
 namespace strata::gpu { void* host_view(const void* device_pointer); }
@@ -47,6 +48,7 @@ namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include <numeric>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
@@ -192,6 +194,13 @@ const int32_t* g_mrope_dev = nullptr;
 
 class Window {
 public:
+    bool summary_supported() const;
+    bool continuation_supported() const;
+    uint64_t summary_bytes() const;
+    bool summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err);
+    bool summary_select(bool summary, std::string& err);
+    bool summary_is_selected() const { return summary_saved_ && summary_selected_; }
+    bool summary_end(std::string& err);
     bool init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1, int max_t,
               int64_t max_cells, std::string& err);
     bool run(int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
@@ -380,6 +389,7 @@ private:
     int max_t_ = 1;
     int nexp_ = NEXP;   // the trunk's routed experts per layer (512, or 256 for the Coder); the MTP layer is always NEXP
     int64_t max_cells_ = 0;
+    int64_t allocation_max_cells_ = 0; // permanent shared scratch capacity, never the active bank capacity
     int64_t n_vocab_ = 0;
     float eps_ = 1e-6f;
     // buffers
@@ -420,6 +430,15 @@ private:
         int32_t last_tokens[MAXT] = {};
         strata::core::SessionState* ss = nullptr;
     };
+    // While a bank exists, these descriptors/session/globals hold the INACTIVE bank.
+    std::unique_ptr<SeqSet> summary_saved_;
+    bool summary_selected_ = false;
+    strata::core::SessionState summary_session_{};
+    std::vector<strata::core::QsaState> summary_qsa_;
+    const float* const* summary_embd_ = nullptr;
+    const int32_t* summary_mrope_host_ = nullptr;
+    const int32_t* summary_mrope_dev_ = nullptr;
+    void free_set(SeqSet& s);
     std::vector<std::unique_ptr<SeqSet>> sets_;     // [0] the spare the main state is exchanged with, [b + 1] slot b
     std::map<const strata::core::SessionState*, int> set_of_ss_;
     int active_ = 0;
@@ -503,7 +522,13 @@ public:
     bool prompt_gemm_init(std::string& err);
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
     int prompt_chunk_rows() const;
-    void prompt_region(bool hold) { if (stream_ && st_ && st_->ready()) st_->hold_region(hold); }
+    void prompt_region(bool hold) {
+        if (!stream_ || !st_ || !st_->ready()) return;
+        // A scope unwinding from a host callback must not hand scratch slots back to
+        // expert I/O while a command buffer could still reference them.
+        if (!hold && !cx_->synchronize()) throw std::runtime_error("prompt region GPU release failed");
+        st_->hold_region(hold);
+    }
     void stream_report(FILE* f) const {
         if (!st_) return;
         st_->report(f);
@@ -735,6 +760,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
 
     const int MAXC = (int) std::max<int64_t>(4096, (max_cells + 64) / 4 * 4 + 64), MB = MAXC / 4 + 2;
     max_cells_ = MAXC;
+    allocation_max_cells_ = MAXC;
     auto A = [&](size_t bytes) { return cx_->alloc(bytes); };
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * 10240); z_ = A(4 * MAXT * 6144);
@@ -2075,6 +2101,166 @@ void Window::swap_state(SeqSet& o) {
     std::swap(ss_, o.ss);
 }
 
+// Experimental cooperatively selected summary bank. Weights and scratch remain owned by this Window;
+// every authoritative recurrent/KV buffer is exchanged at its stable Buffer address.
+bool Window::summary_supported() const {
+    // Diagnostic pending rows and destructive profiling replays are not sequence-bank state.
+    for (const char* key : {"STRATA_METAL_LOGPOS", "STRATA_LOGPOS", "STRATA_METAL_SKIP",
+                            "STRATA_METAL_KPROF", "STRATA_METAL_STEPPROF", "STRATA_PROMPT_KPROF", "STRATA_METAL_STREAM_FAKE"})
+        if (std::getenv(key)) return false;
+    return ready() && (!stream_ || st_ != nullptr) && !mtp_on_ && !df2_ && !taps_on_ && sets_.empty() &&
+           !bigs_ok_ && gst_.size() == 36 && kq_.size() == 12 && allocation_max_cells_ >= 16384;
+}
+bool Window::continuation_supported() const {
+    // The continuation driver reads bounded chunks through run(), rather than
+    // prompt_chain(). Non-streaming GEMM prompt scratch is not warmed by that
+    // route, so only the window prompt path can advertise this capability.
+    const char* prompt = std::getenv("STRATA_METAL_PROMPT");
+    return summary_supported() && (stream_ || (prompt && std::strcmp(prompt, "window") == 0));
+}
+uint64_t Window::summary_bytes() const {
+    constexpr uint64_t C = 16384, MB = C / 4 + 2;
+    return 36ull * (4 * 128 * 48 * 128 + 2 * 4 * 10240 * 3) +
+           12ull * (2 * C * 2 * 256 + 2 * 2 * C * 2 * 4 + 4 * 4 * 128 + 4 * 128 + 4 * MB * 128) +
+           4 * 9 * 10240 + (ple_hist_.size() + last_norm_.size()) * sizeof(float) +
+           12 * sizeof(strata::core::QsaState) + sizeof(SeqSet) + sizeof(strata::core::SessionState) +
+           (36 * 3 + 12 * 7) * sizeof(mtl::Buffer);
+}
+void Window::free_set(SeqSet& s) {
+    for (auto* v : {&s.gst, &s.gh0, &s.gh1, &s.kq, &s.vq, &s.ksc, &s.vsc, &s.tail, &s.dead, &s.pooled})
+        for (auto& b : *v) cx_->free(b);
+    cx_->free(s.pleHist);
+}
+bool Window::summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err) {
+    if (!summary_supported() || summary_saved_ || ss_ != &ss || ss.qsa_alloc != 12 || ss.qsa_ord0 != 0) {
+        err = "unsupported Metal state-bank configuration"; return false;
+    }
+    const char* ep = std::getenv("STRATA_METAL_PROMPT");
+    const char* ec = std::getenv("STRATA_METAL_PROMPT_CHUNK");
+    const int C = std::max(64, std::min(8192, ec ? std::atoi(ec) : 2048));
+    const char* eg = std::getenv("STRATA_METAL_PROMPT_GEMM");
+    if (!strata::core::SummaryStateBank::warmup_ready(stream_, st_ && st_->ready(),
+            !(eg && std::string(eg) == "0"), ep && std::string(ep) == "window", pg_ != nullptr, pb_.C, C)) {
+        err = "shared expert arena and prompt scratch must be warmed by a foreground request first"; return false;
+    }
+    if (cut_ids_ != nullptr) { err = "prompt handshake is still active"; return false; }
+    std::unique_ptr<SeqSet> candidate;
+    try {
+        candidate = std::make_unique<SeqSet>();
+        // Allocate all host descriptors before any device allocation, for bounded cleanup on OOM.
+        candidate->gst.resize(36); candidate->gh0.resize(36); candidate->gh1.resize(36);
+        for (auto* v : {&candidate->kq, &candidate->vq, &candidate->ksc, &candidate->vsc,
+                        &candidate->tail, &candidate->dead, &candidate->pooled}) v->resize(12);
+        candidate->ple_hist.assign(ple_hist_.size(), 0.0f);
+        candidate->last_norm.assign(last_norm_.size(), 0.0f);
+        summary_qsa_.assign(ss.qsa_states, ss.qsa_states + 12);
+        auto A = [&](mtl::Buffer& b, size_t n) {
+            b = cx_->try_alloc(n);
+            if (!b.ptr) throw std::bad_alloc();
+        };
+        for (int i = 0; i < 36; ++i) {
+            A(candidate->gst[i], 4 * 128 * 48 * 128);
+            A(candidate->gh0[i], 4 * 10240 * 3); A(candidate->gh1[i], 4 * 10240 * 3);
+        }
+        constexpr size_t C = 16384, MB = C / 4 + 2;
+        for (int i = 0; i < 12; ++i) {
+            A(candidate->kq[i], C * 2 * 256); A(candidate->vq[i], C * 2 * 256);
+            A(candidate->ksc[i], 2 * C * 2 * 4); A(candidate->vsc[i], 2 * C * 2 * 4);
+            A(candidate->tail[i], 4 * 4 * 128); A(candidate->dead[i], 4 * 128);
+            A(candidate->pooled[i], 4 * MB * 128);
+        }
+        A(candidate->pleHist, 4 * 9 * 10240);
+    } catch (const std::bad_alloc&) {
+        if (candidate) free_set(*candidate); summary_qsa_.clear(); err = "summary bank allocation refused"; return false;
+    }
+    if (!admit()) {
+        free_set(*candidate); summary_qsa_.clear(); err = "pressure or available memory changed during bank allocation"; return false;
+    }
+    // Nothing can publish until all allocations succeeded. Finish deferred main math while
+    // its shared qkv/al/be/z scratch still contains the main window's inputs.
+    if (pc_next_.valid()) (void)pc_next_.get();
+    if (!cx_->synchronize()) throw std::runtime_error("summary bank GPU quiescence failed");
+    if (stream_ && !st_->quiesce(err)) {
+        free_set(*candidate); summary_qsa_.clear(); return false; // no bank/main publication yet
+    }
+    if (!admit()) {
+        free_set(*candidate); summary_qsa_.clear(); err = "pressure or memory changed during quiescence"; return false;
+    }
+    if (pend_fold_ > 0) {
+        std::vector<mtl::Dispatch> ds;
+        nb_ = false; fold(ds, pend_fold_, 1 - hp_); cx_->run_graph(ds); pend_fold_ = 0;
+        if (!cx_->synchronize()) throw std::runtime_error("summary bank fold quiescence failed");
+    }
+    summary_session_ = ss;
+    candidate->ss = &ss;
+    summary_embd_ = g_embd_rows;
+    summary_mrope_host_ = g_mrope_host; summary_mrope_dev_ = g_mrope_dev;
+    g_embd_rows = nullptr; g_mrope_host = nullptr; g_mrope_dev = nullptr;
+    swap_state(*candidate);
+    max_cells_ = 16384;
+    ss.qsa_states = summary_qsa_.data(); ss.max_cells = 16384;
+    ss.ple_prev[0] = ss.ple_prev[1] = -1; ss.ple_token = -1;
+    bind_session(ss);
+    wcache_.clear(); rec_ = nullptr; cuts_ = nullptr; mtp_src_ = nullptr; // no stale dispatch builders
+    // Encoded dispatch geometry belongs to one active capacity only.
+    qdirty_ = true; // shared selection scratch must be regenerated, not restored as state
+    summary_saved_ = std::move(candidate);
+    summary_selected_ = true;
+    return true;
+}
+// Only call between complete prompt chunks or committed decode windows. Logits,
+// sampling history pointers and other shared scratch are not request continuations;
+// the caller must finish consuming them and rebind sampling before its next step.
+bool Window::summary_select(bool summary, std::string& err) {
+    if (!summary_saved_) { err = "no summary bank active"; return false; }
+    if (summary_selected_ == summary) return true;
+    if (cut_ids_ != nullptr) { err = "prompt handshake is still active"; return false; }
+    if (pc_next_.valid()) (void)pc_next_.get();
+    if (!cx_->synchronize()) throw std::runtime_error("summary bank GPU quiescence failed");
+    if (stream_ && !st_->quiesce(err)) return false;
+    // The fold consumes shared qkv/al/be/z scratch. It must finish while the
+    // outgoing bank and its scratch are still mounted, not on a later resume.
+    if (pend_fold_ > 0) {
+        std::vector<mtl::Dispatch> ds;
+        nb_ = false;
+        fold(ds, pend_fold_, 1 - hp_);
+        cx_->run_graph(ds);
+        pend_fold_ = 0;
+        if (!cx_->synchronize()) throw std::runtime_error("summary bank fold quiescence failed");
+    }
+    // Both SeqSet descriptors refer to the stable driver SessionState address.
+    // Its value (including QSA ownership and PLE continuation) follows the bank.
+    swap_state(*summary_saved_);
+    std::swap(*ss_, summary_session_);
+    std::swap(g_embd_rows, summary_embd_);
+    std::swap(g_mrope_host, summary_mrope_host_);
+    std::swap(g_mrope_dev, summary_mrope_dev_);
+    max_cells_ = summary ? 16384 : allocation_max_cells_;
+    bind_session(*ss_);
+    wcache_.clear(); rec_ = nullptr; cuts_ = nullptr; mtp_src_ = nullptr;
+    qdirty_ = true;
+    nb_ = false;
+    set_sampling(nullptr, nullptr, 0); // never keep a pointer into the outgoing request
+    summary_selected_ = summary;
+    return true;
+}
+bool Window::summary_end(std::string& err) {
+    if (!summary_saved_) { err = "no summary bank active"; return false; }
+    // Always leave main mounted. If it was already mounted, its current state
+    // must not be replaced by the snapshot taken when the bank was allocated.
+    if (!summary_select(false, err)) return false;
+    if (pc_next_.valid()) (void)pc_next_.get();
+    if (!cx_->synchronize()) throw std::runtime_error("summary bank GPU quiescence failed");
+    if (cut_ids_ != nullptr || (stream_ && !st_->quiesce(err)))
+        throw std::runtime_error("summary bank stream release did not quiesce");
+    // The inactive allocation is now necessarily the summary allocation.
+    free_set(*summary_saved_); summary_saved_.reset(); summary_qsa_.clear();
+    summary_session_ = {};
+    summary_embd_ = nullptr; summary_mrope_host_ = nullptr; summary_mrope_dev_ = nullptr;
+    summary_selected_ = false;
+    return true;
+}
+
 // the buffers of one sequence's running state, shaped like the live ones (real: allocated and zero; else empty placeholders)
 void Window::alloc_set(SeqSet& o, bool real, int idx) {
     const size_t MAXC = (size_t) max_cells_, MB = MAXC / 4 + 2;
@@ -2932,7 +3118,7 @@ bool Window::prompt_gemm_init(std::string& err) {
     const size_t MT = (size_t) C;
     p.maxrows = C * TOPK + nexp_ * p.TM;
     p.nblk_max = (C * TOPK + 1023) / 1024;
-    const int MB = (int) max_cells_ / 4 + 2;
+    const int MB = (int) allocation_max_cells_ / 4 + 2;
     // the buffers: measured first, then placed - on a streaming Mac inside the expert arena (a region of its slots
     // reserved only while a prompt runs: the prompt's scratch costs no decode memory), else allocated
     uint64_t need = 0;
@@ -3506,6 +3692,18 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
     if (!win->run(T, tokens, pos0, head || logpos, out, err)) return false;
     return !head || win->sample_rows(T, out, err);   // a sampled / penalised / biased request: the head rows' tokens by the sampler chain (nothing to do for greedy)
 }
+bool window_summary_supported() { return g_the_window && g_the_window->summary_supported(); }
+bool window_continuation_supported() { return g_the_window && g_the_window->continuation_supported(); }
+uint64_t window_summary_bytes() { return g_the_window ? g_the_window->summary_bytes() : 0; }
+bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err) {
+    return g_the_window && g_the_window->summary_begin(ss, admit, err);
+}
+bool window_summary_select(bool summary, std::string& err) {
+    if (!g_the_window) { err = "no Metal window"; return false; }
+    return g_the_window->summary_select(summary, err);
+}
+bool window_summary_is_selected() { return g_the_window && g_the_window->summary_is_selected(); }
+bool window_summary_end(std::string& err) { return g_the_window && g_the_window->summary_end(err); }
 void window_reset(const strata::core::SessionState* ss) {
     if (g_the_window == nullptr || !g_the_window->ready()) return;
     g_the_window->activate(g_the_window->set_of(ss));
@@ -3604,14 +3802,17 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
             if (!g_window->prompt_gemm_init(err)) return false;
             const int C = g_window->prompt_chunk_rows();
             std::vector<int32_t> tk32((size_t) C);
-            g_window->prompt_region(true);
+            struct PromptRegionScope {
+                Window* w;
+                explicit PromptRegionScope(Window* v) : w(v) { w->prompt_region(true); }
+                ~PromptRegionScope() { w->prompt_region(false); }
+            } region_scope(g_window);
             bool ok = true;
             for (int64_t c = 0; c < n && ok; c += C) {
                 const int k = (int) std::min<int64_t>(C, n - c);
                 for (int i = 0; i < k; ++i) tk32[(size_t) i] = (int32_t) tokens[c + i];
                 ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err) && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
             }
-            g_window->prompt_region(false);
             return ok;
         }
     }

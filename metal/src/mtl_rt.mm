@@ -556,6 +556,34 @@ void require_fit(const Pipeline& p, uint32_t threads, const char* where) {
     std::exit(6);
 }
 
+bool Context::synchronize() {
+#if defined(STRATA_DS4_RUNTIME)
+    flush_runs();
+#endif
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [impl_->q commandBuffer];
+        if (!cb) return false;
+        [cb commit];
+        [cb waitUntilCompleted];
+        return cb.status == MTLCommandBufferStatusCompleted;
+    }
+}
+
+// Transaction admission must never terminate the foreground process on allocation refusal.
+Buffer Context::try_alloc(size_t bytes) {
+    Buffer r;
+    @autoreleasepool {
+        id<MTLBuffer> b = [impl_->dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!b) return r;
+        std::memset([b contents], 0, bytes);
+        r.handle = (__bridge_retained void*)b;
+        r.ptr = [b contents];
+        r.bytes = bytes;
+    }
+    allocated_ += bytes;
+    return r;
+}
+
 Buffer Context::alloc(size_t bytes) {
 #if defined(STRATA_DS4_RUNTIME)
     // Metal returns the new buffer with one more reference parked in the calling thread's autorelease pool.  The engine's host

@@ -765,6 +765,7 @@ uint8_t* ExpertStream::standalone_region(uint64_t bytes) {
 
 void ExpertStream::hold_region(bool hold) {
     std::unique_lock<std::mutex> g(mu_);
+    if (hold == region_held_) return;
     if (hold) {
         // nothing may be reading into those slots: the queued read-aheads are dropped, the running ones waited for
         std::vector<int> drop;
@@ -785,12 +786,33 @@ void ExpertStream::hold_region(bool hold) {
             x.state = 3;
         }
         if (region_) std::memset(region_, 0, (size_t) region_bytes_);
+        region_held_ = true;
     } else {
         for (int s : region_slots_) {
             slots_[(size_t) s].state = 0;
             if (!retired_[(size_t) s]) lru_back(s);   // a retired slot's memory serves the prompt only
         }
+        region_held_ = false;
     }
+}
+
+bool ExpertStream::quiesce(std::string& err) {
+    std::unique_lock<std::mutex> g(mu_);
+    if (!ready() || region_held_) { err = "expert arena is cold or prompt region is still held"; return false; }
+    // Cancel only wholly queued read-aheads. Partially running slots must finish all
+    // their remaining pieces; cancel_slot would otherwise invalidate a writer's target.
+    for (;;) {
+        int drop = -1;
+        for (const Job& j : pre_q_)
+            if (slots_[(size_t)j.slot].state.load() == 1) { drop = j.slot; break; }
+        if (drop < 0) break;
+        cancel_slot(drop);
+    }
+    cv_.notify_all();
+    if (!done_cv_.wait_for(g, std::chrono::seconds(60), [&] { return outstanding_ == 0; })) {
+        err = "expert prefetch did not quiesce within 60 seconds"; return false;
+    }
+    return true;
 }
 
 void ExpertStream::reset_stats() {

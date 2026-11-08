@@ -104,6 +104,8 @@ public:
     int compile_try(const std::vector<std::string>& files, const std::string& prelude, bool fast_math, std::string* why);
     Pipeline pipeline(int lib, const std::string& fn, const Constants& c = {});
 
+    bool synchronize();                        // checked barrier on the primary command queue
+    Buffer try_alloc(size_t bytes);              // nonfatal, empty on Metal allocation failure
     Buffer alloc(size_t bytes);                  // shared storage, zeroed
     Buffer wrap(void* page_aligned, size_t bytes);  // no-copy wrap (page-aligned, size multiple of page)
     // the same, also when bytes > maxBufferLength: then overlapping chunks, each holding any range of up to
