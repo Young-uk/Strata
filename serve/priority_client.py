@@ -223,6 +223,17 @@ class ContinuationClient:
         produced = committed = 0
         totals = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": None,
                   "decode_ms": None, "reused": 0, "prompt_read": 0, "finish": "cancel"}
+        clone = getattr(cancel, "_atomic_clone_snapshot", None) if owner.summary else None
+        # Record only a finished text request. Interrupted or image work must
+        # invalidate the former owner before it can be mistaken for this cache.
+        emitted = []
+        cache_owner = sampling.get("atomic_cache_owner") if not owner.summary else None
+        if not owner.summary: self.engine.atomic_main_snapshot = None
+        if clone:
+            ids = [clone["tail"], *ids]
+            totals["prompt_tokens"] = len(ids)
+        clone_base = clone["tokens"] if clone else 0
+        if clone: totals["cloned_tokens"] = clone_base
         self.engine.last = {}
         self.engine.progress, self.engine.progress_ms = (0, len(ids)), 0
         cancel._atomic_input_cache = 0
@@ -246,7 +257,7 @@ class ContinuationClient:
                         in_flight = "admission"
                         try:
                             self.engine._send_for(self.generation,
-                                f"AGEN {identity} {'summary' if owner.summary else 'main'} {max_new} " +
+                                f"{'AFORK' if clone else 'AGEN'} {identity} {'summary' if owner.summary else 'main'} {max_new} " +
                                 (keys + " " if keys else "") + ",".join(str(int(t)) for t in ids))
                         except BaseException as exc:
                             raise self.poison("native admission write outcome is uncertain") from exc
@@ -261,7 +272,9 @@ class ContinuationClient:
                         if len(fields) != 4 or fields[0] != "AREADY":
                             raise self.poison("invalid native admission acknowledgment")
                         try:
-                            committed, prompt_count = self._number(fields[2], len(ids)), self._number(fields[3], len(ids))
+                            committed, prompt_count = self._number(fields[2], len(ids) + clone_base), self._number(fields[3], len(ids) + clone_base)
+                            committed -= clone_base
+                            prompt_count -= clone_base
                         except ValueError as exc:
                             raise self.poison(str(exc)) from exc
                         if prompt_count != len(ids):
@@ -270,7 +283,7 @@ class ContinuationClient:
                         totals["reused"] = committed
                         self.engine.progress = (committed, len(ids))
                         self.engine.reused = committed
-                        cancel._atomic_input_progress = (committed, len(ids), committed, 0)
+                        cancel._atomic_input_progress = (committed + clone_base, len(ids) + clone_base, committed + clone_base, 0)
                 finally:
                     try:
                         if in_flight and not self.scheduler.poison_reason:
@@ -334,6 +347,7 @@ class ContinuationClient:
                     for item in preparation["logprobs"]:
                         cancel._strata_lp_lines.append(item)
                 for token in preparation["tokens"]:
+                    emitted.append(token)
                     yield token
             mark_started()
             while not completed:
@@ -346,7 +360,7 @@ class ContinuationClient:
                         try:
                             # A foreground arrival after this decision waits for at most
                             # 128 committed summary inputs, then the ordinary weighted turn.
-                            budget = (min(self.summary_max_inputs, self.scheduler.summary_input_quantum(owner))
+                            budget = (min(self.summary_max_inputs, self.scheduler.summary_input_quantum(owner, cached=True) if clone else self.scheduler.summary_input_quantum(owner))
                                       if owner.summary and self.idle_summary_inputs else None)
                             suffix = f" {budget}" if budget is not None else ""
                             self.engine._send_for(self.generation, f"ANEXT {identity}{suffix}")
@@ -370,7 +384,7 @@ class ContinuationClient:
                                 continue
                             if len(fields) == 5 and fields[0] == "AYIELD" and fields[2] in ("prefill", "decode"):
                                 try:
-                                    cursor = self._number(fields[3], len(ids) + max_new)
+                                    cursor = self._number(fields[3], len(ids) + clone_base + max_new) - clone_base
                                     count = self._number(fields[4], max_new)
                                 except ValueError as exc:
                                     raise self.poison(str(exc)) from exc
@@ -379,7 +393,7 @@ class ContinuationClient:
                                 in_flight = None
                                 committed, produced = cursor, count
                                 self.engine.progress = (min(committed, len(ids)), len(ids))
-                                cancel._atomic_input_progress = (min(committed, len(ids)), len(ids), totals["reused"], 0)
+                                cancel._atomic_input_progress = (min(committed, len(ids)) + clone_base, len(ids) + clone_base, totals["reused"] + clone_base, 0)
                                 break
                             if len(fields) == 4 and fields[0] == "ADONE" and fields[2] in ("stop", "length"):
                                 try:
@@ -403,7 +417,7 @@ class ContinuationClient:
                                     produced = self._number(fields[3], max_new)
                                     totals["finish"] = fields[2]
                                 else:
-                                    committed = self._number(fields[3], len(ids) + max_new)
+                                    committed = self._number(fields[3], len(ids) + clone_base + max_new) - clone_base
                                     produced = self._number(fields[4], max_new)
                             except ValueError as exc:
                                 raise self.poison(str(exc)) from exc
@@ -415,6 +429,7 @@ class ContinuationClient:
                 if cancel.is_set():
                     return
                 for token in output:
+                    emitted.append(token)
                     yield token
                 if not output and not completed:
                     yield None
@@ -437,3 +452,11 @@ class ContinuationClient:
             if completed and totals.get("finish") in ("stop", "length"):
                 totals["prompt_read"] = len(ids) - totals["reused"]
             self.engine.last = totals
+            if not owner.summary and not embeddings and completed and totals.get("finish") == "stop" and emitted and cache_owner and not cancel.is_set():
+                committed_ids = [*ids, *emitted[:-1]]
+                h = 14695981039346656037
+                for token in committed_ids:
+                    for shift in (0, 8, 16, 24):
+                        h = ((h ^ ((token >> shift) & 255)) * 1099511628211) & ((1 << 64) - 1)
+                self.engine.atomic_main_snapshot = {"owner": cache_owner, "tokens": len(committed_ids), "hash": h, "tail": emitted[-1], "ids": committed_ids}
+

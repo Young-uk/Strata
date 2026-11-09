@@ -181,7 +181,7 @@ class WeightedScheduler:
         finally:
             release()
 
-    def summary_input_quantum(self, owner):
+    def summary_input_quantum(self, owner, *, cached=False):
         """Choose only while holding the compute permit; arrivals wait at most this quantum."""
         with self.cv:
             self._check()
@@ -191,7 +191,7 @@ class WeightedScheduler:
                 return 2048
             foreground = self.owners[False]
             waiting = any(not item.cancel.is_set() for item in self.waiters[False])
-            return 1 if (foreground is not None and not foreground.closed) or waiting else 128
+            return 1 if (foreground is not None and not foreground.closed) or waiting else 2048 if cached else 128
 
     def close(self, owner):
         with self.cv:

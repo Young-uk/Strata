@@ -198,8 +198,9 @@ public:
     bool history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err);
     bool summary_supported() const;
     bool continuation_supported() const;
-    uint64_t summary_bytes() const;
-    bool summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err);
+    uint64_t summary_bytes(bool clone = false) const;
+    uint64_t summary_clone_capacity() const { return uint64_t(allocation_max_cells_); }
+    bool summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err, bool clone = false);
     bool summary_select(bool summary, std::string& err);
     bool summary_is_selected() const { return summary_saved_ && summary_selected_; }
     bool summary_end(std::string& err);
@@ -435,6 +436,7 @@ private:
     // While a bank exists, these descriptors/session/globals hold the INACTIVE bank.
     std::unique_ptr<SeqSet> summary_saved_;
     bool summary_selected_ = false;
+    int64_t summary_capacity_ = 16384;
     strata::core::SessionState summary_session_{};
     std::vector<strata::core::QsaState> summary_qsa_;
     const float* const* summary_embd_ = nullptr;
@@ -760,6 +762,17 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     lsmp_ = cx_->compile({"sample.metal"}, "#define NO_GGML_COMMON 1\n");
     lple_ = cx_->compile({strata_metal::resource("STRATA_METAL_ENGINE_KERNELS", "engine-msl", STRATA_METAL_ENGINE_KERNELS_DEFAULT) + "/ple.metal"}, "#define NO_GGML_COMMON 1\n");
 
+    // Optional physical headroom is reserved for a clone's appended task and
+    // answer. The foreground driver still enforces its original logical context.
+    if (const char* reserve = std::getenv("STRATA_ATOMIC_SUMMARY_HEADROOM_TOKENS")) {
+        uint64_t n = 0;
+        const auto parsed = std::from_chars(reserve, reserve + std::strlen(reserve), n);
+        if (parsed.ec != std::errc{} || parsed.ptr != reserve + std::strlen(reserve) ||
+            n > 8192 || max_cells > INT32_MAX - int64_t(n) - 128) {
+            err = "invalid cached-summary physical headroom"; return false;
+        }
+        max_cells += int64_t(n);
+    }
     const int MAXC = (int) std::max<int64_t>(4096, (max_cells + 64) / 4 * 4 + 64), MB = MAXC / 4 + 2;
     max_cells_ = MAXC;
     allocation_max_cells_ = MAXC;
@@ -2120,8 +2133,8 @@ bool Window::continuation_supported() const {
     const char* prompt = std::getenv("STRATA_METAL_PROMPT");
     return summary_supported() && (stream_ || (prompt && std::strcmp(prompt, "window") == 0));
 }
-uint64_t Window::summary_bytes() const {
-    constexpr uint64_t C = 16384, MB = C / 4 + 2;
+uint64_t Window::summary_bytes(bool clone) const {
+    const uint64_t C = clone ? uint64_t(allocation_max_cells_) : 16384, MB = C / 4 + 2;
     return 36ull * (4 * 128 * 48 * 128 + 2 * 4 * 10240 * 3) +
            12ull * (2 * C * 2 * 256 + 2 * 2 * C * 2 * 4 + 4 * 4 * 128 + 4 * 128 + 4 * MB * 128) +
            4 * 9 * 10240 + (ple_hist_.size() + last_norm_.size()) * sizeof(float) +
@@ -2133,7 +2146,7 @@ void Window::free_set(SeqSet& s) {
         for (auto& b : *v) cx_->free(b);
     cx_->free(s.pleHist);
 }
-bool Window::summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err) {
+bool Window::summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err, bool clone) {
     if (!summary_supported() || summary_saved_ || ss_ != &ss || ss.qsa_alloc != 12 || ss.qsa_ord0 != 0) {
         err = "unsupported Metal state-bank configuration"; return false;
     }
@@ -2184,7 +2197,7 @@ bool Window::summary_begin(strata::core::SessionState& ss, const std::function<b
             A(candidate->gst[i], 4 * 128 * 48 * 128);
             A(candidate->gh0[i], 4 * 10240 * 3); A(candidate->gh1[i], 4 * 10240 * 3);
         }
-        constexpr size_t C = 16384, MB = C / 4 + 2;
+        const size_t C = clone ? size_t(allocation_max_cells_) : 16384, MB = C / 4 + 2;
         for (int i = 0; i < 12; ++i) {
             A(candidate->kq[i], C * 2 * 256); A(candidate->vq[i], C * 2 * 256);
             A(candidate->ksc[i], 2 * C * 2 * 4); A(candidate->vsc[i], 2 * C * 2 * 4);
@@ -2213,15 +2226,34 @@ bool Window::summary_begin(strata::core::SessionState& ss, const std::function<b
         nb_ = false; fold(ds, pend_fold_, 1 - hp_); cx_->run_graph(ds); pend_fold_ = 0;
         if (!cx_->synchronize()) throw std::runtime_error("summary bank fold quiescence failed");
     }
+    if (clone) {
+        // All GPU writers and deferred folds are drained above. Copy into
+        // independent allocations; never alias recurrent, PLE, KV or indexer state.
+        auto copy = [](const auto& from, auto& to) {
+            for (size_t i = 0; i < from.size(); ++i)
+                std::memcpy(to[i].ptr, from[i].ptr, from[i].bytes);
+        };
+        copy(gst_, candidate->gst); copy(ghist_[0], candidate->gh0); copy(ghist_[1], candidate->gh1);
+        copy(kq_, candidate->kq); copy(vq_, candidate->vq); copy(ksc_, candidate->ksc); copy(vsc_, candidate->vsc);
+        copy(tail_, candidate->tail); copy(dead_, candidate->dead); copy(pooled_, candidate->pooled);
+        std::memcpy(candidate->pleHist.ptr, pleHist_.ptr, pleHist_.bytes);
+        candidate->ple_hist = ple_hist_; candidate->last_norm = last_norm_;
+        candidate->hp = hp_; candidate->pend_fold = pend_fold_;
+        candidate->last_T = last_T_; candidate->last_head = last_head_;
+        for (int t = 0; t < MAXT; ++t) candidate->last_tokens[t] = last_tokens_[t];
+        summary_qsa_.assign(ss.qsa_states, ss.qsa_states + 12);
+    }
     summary_session_ = ss;
     candidate->ss = &ss;
     summary_embd_ = g_embd_rows;
     summary_mrope_host_ = g_mrope_host; summary_mrope_dev_ = g_mrope_dev;
     g_embd_rows = nullptr; g_mrope_host = nullptr; g_mrope_dev = nullptr;
     swap_state(*candidate);
-    max_cells_ = 16384;
-    ss.qsa_states = summary_qsa_.data(); ss.max_cells = 16384;
-    ss.ple_prev[0] = ss.ple_prev[1] = -1; ss.ple_token = -1;
+    summary_capacity_ = clone ? allocation_max_cells_ : 16384;
+    max_cells_ = summary_capacity_;
+    ss.qsa_states = summary_qsa_.data(); ss.max_cells = summary_capacity_;
+    if (clone) for (auto& state : summary_qsa_) state.max_cells = summary_capacity_;
+    if (!clone) { ss.ple_prev[0] = ss.ple_prev[1] = -1; ss.ple_token = -1; }
     bind_session(ss);
     wcache_.clear(); rec_ = nullptr; cuts_ = nullptr; mtp_src_ = nullptr; // no stale dispatch builders
     // Encoded dispatch geometry belongs to one active capacity only.
@@ -2257,7 +2289,7 @@ bool Window::summary_select(bool summary, std::string& err) {
     std::swap(g_embd_rows, summary_embd_);
     std::swap(g_mrope_host, summary_mrope_host_);
     std::swap(g_mrope_dev, summary_mrope_dev_);
-    max_cells_ = summary ? 16384 : allocation_max_cells_;
+    max_cells_ = summary ? summary_capacity_ : allocation_max_cells_;
     bind_session(*ss_);
     wcache_.clear(); rec_ = nullptr; cuts_ = nullptr; mtp_src_ = nullptr;
     qdirty_ = true;
@@ -3752,9 +3784,10 @@ bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std:
 }
 bool window_summary_supported() { return g_the_window && g_the_window->summary_supported(); }
 bool window_continuation_supported() { return g_the_window && g_the_window->continuation_supported(); }
-uint64_t window_summary_bytes() { return g_the_window ? g_the_window->summary_bytes() : 0; }
-bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err) {
-    return g_the_window && g_the_window->summary_begin(ss, admit, err);
+uint64_t window_summary_capacity() { return g_the_window ? g_the_window->summary_clone_capacity() : 0; }
+uint64_t window_summary_bytes(bool clone) { return g_the_window ? g_the_window->summary_bytes(clone) : 0; }
+bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err, bool clone) {
+    return g_the_window && g_the_window->summary_begin(ss, admit, err, clone);
 }
 bool window_summary_select(bool summary, std::string& err) {
     if (!g_the_window) { err = "no Metal window"; return false; }

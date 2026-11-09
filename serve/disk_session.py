@@ -14,12 +14,20 @@ import uuid
 
 
 class DiskSession:
-    def __init__(self, directory, identity, max_bytes=4 * 1024**3):
+    def __init__(self, directory, identity, max_bytes=4 * 1024**3, previous_backend_sha256=None):
         self.directory = Path(directory)
         if not self.directory.is_absolute() or self.directory.is_symlink():
             raise ValueError('disk session directory must be an absolute non-symlink path')
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.identity = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        self.compatible_identities = {self.identity}
+        # A reviewed backend-only update may retain the same native session
+        # format. Never relax the native binary or model identity checks.
+        if previous_backend_sha256 is not None:
+            if not re.fullmatch(r'[a-f0-9]{64}', previous_backend_sha256):
+                raise ValueError('invalid previous disk-session backend identity')
+            previous = {**identity, 'atomic_summary_expected_backend_sha256': previous_backend_sha256}
+            self.compatible_identities.add(hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest())
         self.max_bytes = max_bytes
         self.manifest = self.directory / 'latest.json'
 
@@ -27,7 +35,7 @@ class DiskSession:
         if self.manifest.is_symlink():
             raise ValueError('session manifest is a symlink')
         record = json.loads(self.manifest.read_text())
-        if require_identity and record.get('identity') != self.identity:
+        if require_identity and record.get('identity') not in self.compatible_identities:
             return None
         name = record.get('file', '')
         if not re.fullmatch(r'[a-f0-9]{32}\.session', name):
@@ -40,7 +48,32 @@ class DiskSession:
             raise ValueError('session file is missing or changed')
         return record
 
+    @staticmethod
+    def _binding(value, tokens):
+        if not isinstance(value, dict):
+            return None
+        owner = value.get('owner')
+        if (not isinstance(owner, str) or not 0 < len(owner) <= 512 or
+                type(value.get('tokens')) is not int or value['tokens'] != tokens or
+                type(value.get('hash')) is not int or not 0 <= value['hash'] < 2**64 or
+                type(value.get('tail')) is not int or not 0 <= value['tail'] < 2**32):
+            return None
+        # A receipt without a semantic history hash is never a startup clone.
+        history_hash = value.get('history_hash')
+        if not isinstance(history_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', history_hash):
+            return None
+        return {key: value[key] for key in ('owner', 'tokens', 'hash', 'tail', 'history_hash')}
+
+    @staticmethod
+    def _sha256(path):
+        digest = hashlib.sha256()
+        with path.open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(block)
+        return digest.hexdigest()
+
     def restore(self, engine):
+        engine.atomic_main_snapshot = None
         try:
             record = self._record()
         except FileNotFoundError:
@@ -48,6 +81,14 @@ class DiskSession:
         if not record:
             return None
         result = engine.session_file('restore', str(self.directory / record['file']))
+        binding = self._binding(record.get('clone_binding'), result['tokens'])
+        # The native FORK also checks the committed token count and token hash.
+        # Legacy manifests restore inference state but cannot claim a clone owner.
+        if (binding and record.get('session_sha256') ==
+                self._sha256(self.directory / record['file'])):
+            from serve.history_plan import restored_ids
+            ids = restored_ids(self.directory / record['file'], binding)
+            engine.atomic_main_snapshot = {**binding, 'restored': True, **({'ids': ids} if ids is not None else {})}
         print(f"[strata] disk session restored: {result['tokens']} tokens", flush=True)
         return result
 
@@ -83,6 +124,10 @@ class DiskSession:
                 raise ValueError('empty session or disk budget exceeded')
             os.chmod(path, 0o600)
             record = {'identity': self.identity, 'file': name, 'bytes': size, 'tokens': result['tokens']}
+            binding = self._binding(getattr(engine, 'atomic_main_snapshot', None), result['tokens'])
+            if binding:
+                record['clone_binding'] = binding
+                record['session_sha256'] = self._sha256(path)
             temp = self.directory / (name + '.json.tmp')
             try:
                 with temp.open('x', encoding='utf-8') as out:

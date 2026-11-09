@@ -3003,16 +3003,21 @@ class StrataEngine:
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
 
-    def summary_state(self, action, txid=None, *, max_slot_bytes=None):
+    def summary_state(self, action, txid=None, *, max_slot_bytes=None, binding=None):
         """Protocol4 only. No path, disk fallback or inferred native support."""
-        if action not in ("caps", "begin", "end"):
+        if action not in ("caps", "clone_caps", "begin", "fork", "end"):
             raise ValueError("invalid state-bank action")
-        if action != "caps" and (not isinstance(txid, str) or re.fullmatch(r"[A-Za-z0-9]{1,64}", txid) is None):
+        if action not in ("caps", "clone_caps") and (not isinstance(txid, str) or re.fullmatch(r"[A-Za-z0-9]{1,64}", txid) is None):
             raise ValueError("invalid state-bank transaction identity")
-        if action == "begin" and (type(max_slot_bytes) is not int or not 0 < max_slot_bytes <= 9007199254740991):
+        if action in ("begin", "fork") and (type(max_slot_bytes) is not int or not 0 < max_slot_bytes <= 9007199254740991):
             raise ValueError("invalid state-bank budget")
-        command = "SUMMARY_STATE_" + action.upper()
-        if action == "begin": command += f" {max_slot_bytes} {txid}"
+        if action == "fork" and (not isinstance(binding, dict) or
+            type(binding.get("tokens")) is not int or not 0 < binding["tokens"] <= self.max_context or
+            type(binding.get("hash")) is not int or not 0 <= binding["hash"] < 2**64):
+            raise ValueError("invalid clone binding")
+        command = "SUMMARY_CLONE_CAPS" if action == "clone_caps" else "SUMMARY_STATE_" + action.upper()
+        if action in ("begin", "fork"): command += f" {max_slot_bytes} {txid}"
+        if action == "fork": command += f" {binding['tokens']} {binding['hash']}"
         elif action == "end": command += f" {txid}"
         with self._exclusive_control():
             self.proc.stdin.write(command + "\n")
@@ -3028,16 +3033,21 @@ class StrataEngine:
                 if line.startswith(("INFO ", "WARN ")) and time.monotonic() < deadline:
                     continue
                 fields = line.split()
+                if action == "clone_caps":
+                    if fields != ["SUMMARY_CLONE_CAPS", "1", str(self.max_context)]:
+                        raise ValueError("engine lacks bound conversation clone protocol")
+                    self.summary_clone_supported = True
+                    return True
                 if action == "caps":
                     if fields not in (["SUMMARY_STATE_CAPS", "4", "16384"], ["SUMMARY_STATE_CAPS", "6", "16384"]):
                         raise ValueError("engine lacks state-bank protocol4/6")
                     self.summary_state_cold_start = fields[1] == "6"
                     return True
-                if fields[:1] == ["SUMMARY_STATE_REFUSED"] and action == "begin" and len(fields) >= 3 and fields[1] == txid:
+                if fields[:1] == ["SUMMARY_STATE_REFUSED"] and action in ("begin", "fork") and len(fields) >= 3 and fields[1] == txid:
                     refusal = SessionRefused("refused", " ".join(fields[2:]), False)
                     refusal.summary_refused = True
                     raise refusal
-                expected = "SUMMARY_STATE_HELD" if action == "begin" else "SUMMARY_STATE_RELEASED"
+                expected = "SUMMARY_STATE_HELD" if action in ("begin", "fork") else "SUMMARY_STATE_RELEASED"
                 if len(fields) != 5 or fields[0] != expected or fields[1] != txid:
                     raise EngineDied("invalid state-bank acknowledgment; state uncertain")
                 values = fields[2:]
@@ -3046,7 +3056,7 @@ class StrataEngine:
                 tokens, allocated, epoch = map(int, values)
                 if tokens > getattr(self, "max_context", 0) or allocated <= 0 or allocated > 9007199254740991 or not 0 < epoch <= 18446744073709551615:
                     raise EngineDied("invalid state-bank identity bounds")
-                if action == "begin" and allocated > max_slot_bytes:
+                if action in ("begin", "fork") and allocated > max_slot_bytes:
                     raise EngineDied("state-bank allocation exceeded budget")
                 return {"transaction_id": txid, "main_tokens": tokens, "allocated_bytes": allocated, "epoch": values[2]}
 
@@ -3719,7 +3729,7 @@ def engine_binary(exe: str, cfg: dict | None = None) -> str:
     return exe
 
 
-def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
+def effort_end_args(cfg: dict, exe: str, tok, *, announce=True) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
     default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
@@ -3739,8 +3749,9 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
               "effort stays at the top of the prompt", flush=True)
         return None
-    print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
-          "changing it keeps the cached conversation", flush=True)
+    if announce:
+        print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
+              "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
 
 
@@ -5932,6 +5943,10 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "runtime_id": self.instance_id, "atomic_summary": {**self.summary_lane.status(),
+                "restored_cache_owner": (getattr(self.engine, "atomic_main_snapshot", None) or {}).get("owner")
+                    if (getattr(self.engine, "atomic_main_snapshot", None) or {}).get("restored") else None,
+                "restored_cache_hash": (getattr(self.engine, "atomic_main_snapshot", None) or {}).get("history_hash")
+                    if (getattr(self.engine, "atomic_main_snapshot", None) or {}).get("restored") else None,
                 "inference_draining": self.summary_switch_draining,
                 "recovery_stop_ready": self.summary_recovery_stop_ready},
             "atomic_inference_reserved": inference_reserved,
@@ -6153,7 +6168,7 @@ class Service:
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
         if req is not None and req.get("atomic_summary") is True:
-            ctx = min(ctx, atomic_summary.CONTEXT)
+            ctx = ctx if req.get("atomic_summary_clone") else min(ctx, atomic_summary.CONTEXT)
             if len(ids) + max_new + CTX_SLACK > ctx:
                 raise ValueError(f"Prompt has {len(ids)} tokens plus {max_new + CTX_SLACK} reserved output tokens; "
                                  f"summary context limit is {ctx}; requests are never truncated")
@@ -6626,9 +6641,23 @@ class Service:
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
                     if sampling.get("atomic_summary") is True:
-                        if (par and not cooperative) or thinking or tools or len(ids) + max_new + CTX_SLACK > atomic_summary.CONTEXT:
+                        if (par and not cooperative) or thinking or tools or len(ids) + max_new + CTX_SLACK > (self.engine.max_context if sampling.get("atomic_summary_clone") else atomic_summary.CONTEXT):
                             raise ValueError("summary requires isolated text-only 16K context and thinking disabled")
-                        turn.enter_context(self.summary_lane.transaction(self.engine, cancel))
+                        clone_owner = sampling.get("atomic_summary_clone")
+                        if clone_owner is not None:
+                            snapshot = getattr(self.engine, "atomic_main_snapshot", None)
+                            if not getattr(self.summary_lane, "clone_enabled", False) or not snapshot or snapshot["owner"] != clone_owner:
+                                raise atomic_summary.SummaryError("The requested foreground cache is no longer current; originals retained", 409,
+                                    "atomic_summary_clone_stale")
+                            cancel._atomic_clone_snapshot = dict(snapshot)
+                        try:
+                            turn.enter_context(self.summary_lane.transaction(self.engine, cancel))
+                        except BaseException:
+                            # A refused restored receipt must not trap every
+                            # retry before the next foreground cache can warm.
+                            if clone_owner is not None and getattr(self.engine, "atomic_main_snapshot", None) is snapshot:
+                                self.engine.atomic_main_snapshot = None
+                            raise
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -8419,6 +8448,7 @@ def make_handler(svc: Service):
                                      "atomic_model_fingerprint": svc.atomic_model_fingerprint,
                                      "atomic_summary_slot": svc.summary_lane.enabled and not svc.summary_lane.poisoned,
                                      "atomic_summary_context": atomic_summary.CONTEXT,
+                                     "atomic_summary_clone": bool(getattr(svc.summary_lane, "clone_enabled", False)),
                                      "atomic_summary_protocol": 5 if svc.summary_lane.scheduler else 4 if svc.summary_lane.mode == "state-bank-v1" else 3,
                                      "atomic_summary_scheduler": svc.summary_lane.scheduler.status() if svc.summary_lane.scheduler else None,
                                      "atomic_summary_continuation_text_only": False if svc.summary_lane.scheduler else None,
@@ -8623,6 +8653,37 @@ def make_handler(svc: Service):
                     if not self._atomic_owner():
                         return
                     self._json(200, {"atomic_summary": svc.summary_switch_resume()})
+                elif path == "/v1/atomic/history-plan":
+                    if not self._own_page("retained conversation boundaries can be checked"):
+                        return
+                    from serve.history_plan import choose_boundary
+                    snapshot = getattr(svc.engine, "atomic_main_snapshot", None)
+                    def encode_candidate(candidate):
+                        body = {**req, "messages": candidate.get("messages")}
+                        messages, tools, kw = openai_to_messages(body)
+                        require_messages(messages)
+                        return svc.encode_prompt(messages, tools, kw, store=False)
+                    turn = svc.tok.encode("<|im_start|>", parse_special=True)
+                    if len(turn) != 1:
+                        raise ValueError("history planning requires a single-token turn boundary")
+                    result = choose_boundary(snapshot, req.get("owner"), req.get("candidates"),
+                        encode_candidate, turn[0], svc.reported_ctx())
+                    if getattr(svc.engine, "atomic_main_snapshot", None) is not snapshot:
+                        result = {"boundary": None, "reason": "cache-changed"}
+                    self._json(200, result)
+                elif path == "/v1/atomic/cache-receipt":
+                    if not self._own_page("a completed cache history receipt can be recorded"):
+                        return
+                    owner, history_hash = req.get("owner"), req.get("history_hash")
+                    if not isinstance(owner, str) or not isinstance(history_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", history_hash):
+                        raise ValueError("invalid cache history receipt")
+                    snapshot = getattr(svc.engine, "atomic_main_snapshot", None)
+                    if not snapshot or snapshot.get("owner") != owner:
+                        raise atomic_summary.SummaryError("Foreground cache changed; receipt not saved", 409, "atomic_summary_clone_stale")
+                    # Mutate the captured receipt only: if another foreground
+                    # replaces it, never resurrect that old snapshot object.
+                    snapshot["history_hash"] = history_hash
+                    self._json(200, {"saved": getattr(svc.engine, "atomic_main_snapshot", None) is snapshot})
                 elif path == "/v1/atomic/summary-token-count":
                     self._summary_count_tokens(req)
                 elif path == "/v1/messages/count_tokens":
@@ -9841,15 +9902,15 @@ def prepare_summary_qualification_pins(raw_cfg, *, offline=False, batch_telemetr
 
     Invoke under the same launch environment. A fallback/retry not represented
     by this intended spawn is rejected by the post-start optional-feature gate.
-    Current qualification supports effort at start only; never guess token IDs.
+    Resolve end-position effort through the configured tokenizer; never guess token IDs.
     """
     import copy
     from types import SimpleNamespace
     cfg = copy.deepcopy(raw_cfg)
     split_joined_args(cfg)
     cfg = apply_vision_defaults(with_component_engine(apply_saved_tuning(cfg)))
-    if cfg.get("effort_position", "start") != "start":
-        raise ValueError("prelaunch summary pins require explicitly qualified effort_position=start")
+    if cfg.get("effort_position", "start") not in ("start", "end"):
+        raise ValueError("prelaunch summary pins require effort_position=start or end")
     if engine_component.is_reference(cfg["exe"]):
         exe = _component_exe(cfg["exe"], cfg)
     else:
@@ -9857,6 +9918,24 @@ def prepare_summary_qualification_pins(raw_cfg, *, offline=False, batch_telemetr
     env = child_env(cfg, offline=offline)
     configure_batch_telemetry_env(env, cfg, batch_telemetry)
     args = engine_args(cfg, exe, announce=False)
+    if cfg.get("effort_position") == "end":
+        # Match startup's tokenizer constructor and effort_end_args exactly. The
+        # checkpoint role is part of the observed spawn and its qualification.
+        import strata_tokenizer as ST
+        tpath = Path(cfg["tokenizer"])
+        vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for token, index in vocab.items():
+            tokens[index] = token
+        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+        types = json.loads((tpath / "token_type.json").read_text())
+        config_path = tpath / "tokenizer.json"
+        tcfg = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+        effort_args = effort_end_args(cfg, exe, tok, announce=False)
+        if not effort_args:
+            raise ValueError("end-position effort checkpoint is unavailable; prelaunch pins refused")
+        args += effort_args
     expected = SimpleNamespace(spawn=(exe, args, cfg.get("cwd"), cfg.get("log"), env))
     return atomic_summary.qualified_runtime_pins(atomic_summary.runtime_qualification_config(cfg, expected))
 
@@ -10667,7 +10746,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         try:
             observed = atomic_summary.runtime_qualification_config(cfg, svc.engine)
             identity = atomic_summary.qualified_runtime_pins(observed)
-            disk_session = DiskSession(cfg["atomic_disk_session_dir"], identity)
+            disk_session = DiskSession(cfg["atomic_disk_session_dir"], identity,
+                previous_backend_sha256=cfg.get("atomic_disk_session_previous_backend_sha256"))
             try:
                 if disk_session.restore(svc.engine) is None:
                     print("[strata] disk session: no compatible saved session (cold start)", flush=True)
@@ -10685,6 +10765,14 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         summary_enabled = atomic_summary.configure_optional_lane(
             svc.summary_lane, svc.engine, cfg,
             engine_name=a.engine, arch=svc.model_arch, groups=groups)
+        if (cfg.get("atomic_summary_clone_enabled") is True and summary_enabled
+            and cfg.get("atomic_summary_scheduler") == "weighted-quanta-v1"):
+            try:
+                svc.engine.summary_state("clone_caps")
+                svc.summary_lane.clone_enabled = True
+            except Exception:
+                svc.summary_lane.clone_enabled = False
+                print("[strata] cached conversation summaries unavailable; legacy summaries retained", flush=True)
         if cfg.get("atomic_summary_scheduler") is not None:
             try:
                 if not summary_enabled or svc.summary_lane.mode != "state-bank-v1" or cfg["atomic_summary_scheduler"] != "weighted-quanta-v1":

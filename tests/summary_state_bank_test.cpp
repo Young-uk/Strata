@@ -43,6 +43,19 @@ int main() {
     check(!SummaryStateBank::prepare_resources(is_ready, admit, [] { return false; }, err));
     check(!ready);
     check(!SummaryStateBank::prepare_resources(is_ready, admit, [] { return true; }, err));
+    uint64_t count = 0, hash = 0;
+    check(SummaryStateBank::parse_fork("2000000000 Fork1 60000 18446744073709551615", budget, id, count, hash));
+    check(count == 60000 && hash == UINT64_MAX);
+    for (const std::string args : {"1 Job 0 1", "1 Job 01 1", "1 Job 1 -1", "1 Job 1 18446744073709551616", "1 Job 1 1 trailing"})
+        check(!SummaryStateBank::parse_fork(args, budget, id, count, hash));
+    const std::vector<int32_t> original{1, 2, 300};
+    check(SummaryStateBank::token_hash(original) == 2667089169370006325ull);
+    check(SummaryStateBank::token_hash(original) != SummaryStateBank::token_hash({1, 300, 2}));
+    check(SummaryStateBank::token_hash(original) != SummaryStateBank::token_hash({1, 2}));
+    check(SummaryStateBank::clone_room(200000, 1000, 2048, 65536));
+    check(!SummaryStateBank::clone_room(262000, 1000, 2048, 65536));
+    check(!SummaryStateBank::clone_room(262144, 1, 1, 65536));
+    check(!SummaryStateBank::clone_room(0, UINT64_MAX, 2048, 65536));
     SummaryStateBank tx;
     check(!tx.active()); check(tx.allows("SAVE original"));
     tx.id = "Job1"; tx.epoch = 1; tx.main_tokens = 65536; tx.allocated_bytes = 400000000;

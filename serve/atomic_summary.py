@@ -33,6 +33,9 @@ def request(req, *, count=False):
     """Validate the same wire request for counting and generation, without mutation."""
     if req.get("atomic_summary") is not True or req.get("think") is not False:
         raise ValueError("summary requests require atomic_summary:true and think:false")
+    if "atomic_summary_clone" in req and (not isinstance(req["atomic_summary_clone"], str) or
+        re.fullmatch(r"[A-Za-z0-9_:/.-]{1,256}", req["atomic_summary_clone"]) is None):
+        raise ValueError("invalid cached summary owner")
     if "atomic_summary_recovery" in req and type(req["atomic_summary_recovery"]) is not bool:
         raise ValueError("atomic_summary_recovery must be a boolean")
     if req.get("tools") or req.get("strata_mcp") or req.get("response_format"):
@@ -121,7 +124,7 @@ def model_fingerprint(cfg):
     if cfg.get("atomic_summary_mode") == "state-bank-v1":
         payload["contract"] = "shared-weights-state-bank-v4"
         payload["state_bank"] = {key: cfg.get(key) for key in (
-            "atomic_summary_mode", "atomic_summary_state_bank_enabled",
+            "atomic_summary_mode", "atomic_summary_clone_enabled", "atomic_summary_state_bank_enabled",
             "atomic_summary_state_bank_max_bytes", "atomic_summary_state_bank_provenance",
             "atomic_summary_scheduler", "atomic_summary_foreground_weight")}
     return "strata-stat-v2:" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -185,7 +188,7 @@ def qualified_runtime_pins(cfg):
     exe = ((cwd / exe) if not exe.is_absolute() else exe).resolve()
     here = Path(__file__).resolve().parent
     source_hashes = {name: _stable_file_sha(str(here / name), _file_identity(here / name))
-                     for name in ("server.py", "atomic_summary.py", "priority.py", "priority_client.py", "disk_session.py")}
+                     for name in ("server.py", "atomic_summary.py", "priority.py", "priority_client.py", "disk_session.py", "history_plan.py")}
     return dict(zip(QUALIFICATION_PIN_KEYS, (
         _stable_file_sha(str(exe), _file_identity(exe)),
         model_fingerprint(cfg),
@@ -290,6 +293,7 @@ def snapshot_mode(result, path):
 class SummaryLane:
     def __init__(self):
         self.enabled = False
+        self.clone_enabled = False
         self.scheduler = None
         self.mode = "serial-snapshot-v1"
         self.max_slot_bytes = None
@@ -467,7 +471,8 @@ class SummaryLane:
                     for attempt in range(2):
                         try:
                             with native_turn():
-                                begun = engine.summary_state("begin", txid, max_slot_bytes=self.max_slot_bytes)
+                                snapshot = getattr(cancel, "_atomic_clone_snapshot", None)
+                                begun = engine.summary_state("fork", txid, max_slot_bytes=self.max_slot_bytes, binding=snapshot) if snapshot else engine.summary_state("begin", txid, max_slot_bytes=self.max_slot_bytes)
                             break
                         except BaseException as exc:
                             refused = getattr(exc, "summary_refused", False)

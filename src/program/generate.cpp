@@ -165,8 +165,9 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 bool window_summary_supported();
 bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err);
 bool window_continuation_supported();
-uint64_t window_summary_bytes();
-bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err);
+uint64_t window_summary_bytes(bool clone = false);
+uint64_t window_summary_capacity();
+bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err, bool clone = false);
 bool window_summary_end(std::string& err);
 bool window_summary_select(bool summary, std::string& err);
 void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
@@ -11977,6 +11978,9 @@ int main(int argc, char** argv) {
         strata::core::SummaryStateBank summary_bank;
         strata::core::NativeContinuation continuations[2];
         bool continuation_summary_selected = false, summary_bank_nan = false;
+        bool summary_bank_cloned = false;
+        uint64_t summary_clone_next_position = 0;
+        int32_t* summary_clone_positions = nullptr;
         std::vector<int32_t> summary_bank_live;
         std::vector<ImgKey> summary_bank_imgs;
         bool summary_bank_live_ok = false, summary_bank_pristine = false;
@@ -15503,7 +15507,8 @@ int main(int argc, char** argv) {
 #endif
                 std::fflush(stdout); continue;
             }
-            const bool ainit = line.rfind("AGEN ", 0) == 0;
+            const bool afork = line.rfind("AFORK ", 0) == 0;
+            const bool ainit = line.rfind("AGEN ", 0) == 0 || afork;
             const bool astep = line.rfind("ANEXT ", 0) == 0;
             const bool acancel = line.rfind("ACANCEL ", 0) == 0;
             if (ainit || astep || acancel) {
@@ -15513,7 +15518,7 @@ int main(int argc, char** argv) {
                 };
                 if (ainit) {
                     strata::core::NativeContinuation incoming;
-                    if (!strata::core::NativeContinuation::parse(line.substr(5), n_vocab, incoming, ae)) {
+                    if (!strata::core::NativeContinuation::parse(line.substr(afork ? 6 : 5), n_vocab, incoming, ae)) {
                         refused("arguments", ae); continue;
                     }
                     aid = incoming.id;
@@ -15527,7 +15532,23 @@ int main(int argc, char** argv) {
                     if (incoming.summary && !summary_bank.active()) {
                         refused("bank", "summary bank is not held"); continue;
                     }
-                    const uint64_t cap = incoming.summary ? 16384 : (uint64_t)o.max_context;
+                    if (afork) {
+                        if (!incoming.summary || !summary_bank_cloned ||
+                            !(continuation_summary_selected ? live_ok : summary_bank_live_ok)) {
+                            refused("clone", "AFORK requires the selected bound summary clone"); continue;
+                        }
+                        // Append instructions directly to the frozen committed token sequence.
+                        // No retokenization or replay of the conversation is involved.
+                        const auto& frozen = continuation_summary_selected ? live : summary_bank_live;
+                        if (frozen.size() != summary_bank.main_tokens ||
+                            !strata::core::SummaryStateBank::clone_room(summary_clone_next_position,
+                                incoming.ids.size(), incoming.limit, (uint64_t)o.max_context)) {
+                            refused("bounds", "clone absolute-position headroom exhausted or already consumed"); continue;
+                        }
+                        incoming.ids.insert(incoming.ids.begin(), frozen.begin(), frozen.end());
+                        incoming.origin = incoming.ids.size(); incoming.penalty_origin = incoming.origin - 1;
+                    }
+                    const uint64_t cap = incoming.summary ? summary_bank.context : (uint64_t)o.max_context;
                     if (incoming.origin + incoming.limit + 8 > cap || incoming.sampler.penalty_last_n > kPenaltyWindowCap) {
                         refused("bounds", "prompt and output exceed lane or penalty capacity"); continue;
                     }
@@ -15535,7 +15556,8 @@ int main(int argc, char** argv) {
                     // summary can run while an untouched main image context is held.
                     const bool target_image = incoming.summary == continuation_summary_selected
                         ? (!mrope_identity || !live_imgs.empty()) : (!summary_mrope_identity || !summary_bank_imgs.empty());
-                    if (target_image) { refused("images", "v1 does not admit a foreground image context"); continue; }
+                    if (target_image && !(afork && (continuation_summary_selected ? history_approximate : summary_history_approximate) &&
+                        (continuation_summary_selected ? live_imgs.empty() : summary_bank_imgs.empty()))) { refused("images", "v1 does not admit a foreground image context"); continue; }
                     const auto& target_live = incoming.summary == continuation_summary_selected ? live : summary_bank_live;
                     const bool target_ok = incoming.summary == continuation_summary_selected ? live_ok : summary_bank_live_ok;
                     const bool exact_prefix = target_ok && target_live.size() < incoming.origin &&
@@ -15661,8 +15683,8 @@ int main(int argc, char** argv) {
             // No untagged mutation can overwrite a live continuation. Bank creation
             // and release are safe only at these already-drained command boundaries.
             if (prep.id.empty() && (continuations[0].active() || continuations[1].active()) &&
-                line.rfind("SUMMARY_STATE_BEGIN ", 0) != 0 && line.rfind("SUMMARY_STATE_END ", 0) != 0 &&
-                line != "SUMMARY_STATE_CAPS" && line != "QUIT") {
+                line.rfind("SUMMARY_STATE_BEGIN ", 0) != 0 && line.rfind("SUMMARY_STATE_FORK ", 0) != 0 && line.rfind("SUMMARY_STATE_END ", 0) != 0 &&
+                line != "SUMMARY_STATE_CAPS" && line != "SUMMARY_CLONE_CAPS" && line != "QUIT") {
                 std::printf("ASYNC_REFUSED INVALID busy live continuation owns the session\n"); std::fflush(stdout); continue;
             }
             // An attempted ordinary request may partially write state even if parsing/prefill later
@@ -15679,6 +15701,14 @@ int main(int argc, char** argv) {
                             (long long) strata::core::SummaryTransaction::context);
                 std::fflush(stdout);
                 continue;
+            }
+            if (line == "SUMMARY_CLONE_CAPS") {
+                bool capable = false;
+#if defined(STRATA_GPU_METAL)
+                capable = summary_supported() && strata::metal_engine::window_summary_supported();
+#endif
+                std::printf("SUMMARY_CLONE_CAPS %d %lld\n", capable ? 1 : 0, (long long)o.max_context);
+                std::fflush(stdout); continue;
             }
             if (line == "SUMMARY_STATE_CAPS") {
                 bool capable = false;
@@ -15797,13 +15827,15 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
-            const bool state_begin = line.rfind("SUMMARY_STATE_BEGIN ", 0) == 0;
+            const bool state_fork = line.rfind("SUMMARY_STATE_FORK ", 0) == 0;
+            const bool state_begin = line.rfind("SUMMARY_STATE_BEGIN ", 0) == 0 || state_fork;
             const bool state_end = line.rfind("SUMMARY_STATE_END ", 0) == 0;
             if (state_begin || state_end) {
-                uint64_t budget = 0;
+                uint64_t budget = 0, fork_tokens = 0, fork_hash = 0;
                 std::string txid;
                 const bool parsed = state_begin
-                    ? strata::core::SummaryStateBank::parse_begin(line.substr(20), budget, txid)
+                    ? (state_fork ? strata::core::SummaryStateBank::parse_fork(line.substr(19), budget, txid, fork_tokens, fork_hash)
+                                  : strata::core::SummaryStateBank::parse_begin(line.substr(20), budget, txid))
                     : strata::core::SummaryStateBank::valid_id(txid = line.substr(18));
                 auto refuse_state = [&](const std::string& reason) {
                     std::string one = reason;
@@ -15818,7 +15850,20 @@ int main(int argc, char** argv) {
                         !strata::metal_engine::window_summary_supported() || summary_bank.epoch == UINT64_MAX) {
                         refuse_state("state bank unavailable for this configuration or session"); continue;
                     }
-                    const uint64_t bytes = strata::metal_engine::window_summary_bytes();
+                    if (state_fork && (!live_ok || live.empty() || !live_imgs.empty() ||
+                        continuations[0].active() || fork_tokens != live.size() ||
+                        fork_hash != strata::core::SummaryStateBank::token_hash(live))) {
+                        refuse_state("foreground cache changed before clone admission"); continue;
+                    }
+                    // Copy host token/position ownership before any bank publication.
+                    std::vector<int32_t> fork_live;
+                    if (state_fork) {
+                        try { fork_live = live; } catch (const std::bad_alloc&) {
+                            refuse_state("summary clone token allocation refused"); continue;
+                        }
+                    }
+                    const uint64_t position_bytes = state_fork && d_mrope ? mrope_host.size()*sizeof(int32_t) : 0;
+                    const uint64_t bytes = strata::metal_engine::window_summary_bytes(state_fork) + position_bytes;
                     if (!bytes || bytes > budget) { refuse_state("summary slot exceeds byte budget"); continue; }
                     auto health = strata::core::sample_summary_host_health();
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -15835,15 +15880,31 @@ int main(int argc, char** argv) {
                     // Allocate transaction identity before native publication; subsequent ownership swaps cannot allocate.
                     std::string owned_id = txid;
                     bool begun = false;
-                    try { begun = strata::metal_engine::window_summary_begin(ss, admit, err); }
+                    if (position_bytes && (cudaMalloc(&summary_clone_positions, position_bytes) != cudaSuccess ||
+                        cudaMemcpy(summary_clone_positions, mrope_host.data(), position_bytes, cudaMemcpyHostToDevice) != cudaSuccess)) {
+                        if (summary_clone_positions) cudaFree(summary_clone_positions);
+                        summary_clone_positions = nullptr;
+                        refuse_state("summary clone position allocation refused"); continue;
+                    }
+                    try { begun = strata::metal_engine::window_summary_begin(ss, admit, err, state_fork); }
                     catch (...) { std::printf("FATAL uncertain summary bank transition\n"); std::fflush(stdout); return 1; }
-                    if (!begun) { refuse_state(err); continue; }
+                    if (!begun) {
+                        if (summary_clone_positions) cudaFree(summary_clone_positions);
+                        summary_clone_positions = nullptr;
+                        refuse_state(err); continue;
+                    }
+                    summary_bank_cloned = state_fork;
+                    summary_bank.context = state_fork ? strata::metal_engine::window_summary_capacity() : 16384;
+                    summary_clone_next_position = state_fork
+                        ? (history_approximate ? uint64_t(mrope_host[live.size()*3]) : live.size()) : 0;
+                    if (state_fork && summary_clone_positions) strata::kernels::mrope_table_set(summary_clone_positions);
                     summary_bank_live.swap(live); summary_bank_imgs.swap(live_imgs);
-                    summary_bank_live_ok = live_ok; live_ok = false;
+                    summary_bank_live_ok = live_ok; live_ok = state_fork;
+                    if (state_fork) live.swap(fork_live);
                     summary_bank_pristine = summary_pristine; summary_pristine = false;
                     summary_img_rows.swap(img_rows); summary_row_ptr.swap(row_ptr);
-                    summary_mrope_identity = mrope_identity; mrope_identity = true;
-                    summary_history_approximate = history_approximate; history_approximate = false;
+                    summary_mrope_identity = mrope_identity; mrope_identity = state_fork ? summary_mrope_identity : true;
+                    summary_history_approximate = history_approximate; history_approximate = state_fork && summary_history_approximate;
                     summary_has_embd_rows = sp.embd_rows != nullptr; sp.embd_rows = nullptr;
                     summary_checks.swap(checks); std::swap(summary_conversations, conversations);
                     std::swap(summary_kva_floors, kva_floors);
@@ -15857,8 +15918,8 @@ int main(int argc, char** argv) {
                     summary_bank.id.swap(owned_id); ++summary_bank.epoch;
                     continuation_summary_selected = true; summary_bank_nan = false;
                     summary_bank.main_tokens = summary_bank_live.size(); summary_bank.allocated_bytes = bytes;
-                    std::fprintf(stderr, "strata summary state: held epoch %llu, main %llu tokens, slot %llu bytes, shared weights, serial compute\n",
-                        (unsigned long long)summary_bank.epoch, (unsigned long long)summary_bank.main_tokens, (unsigned long long)bytes);
+                    std::fprintf(stderr, "strata summary state: held epoch %llu, main %llu tokens, slot %llu bytes, shared weights, serial compute, cloned=%d\n",
+                        (unsigned long long)summary_bank.epoch, (unsigned long long)summary_bank.main_tokens, (unsigned long long)bytes, state_fork ? 1 : 0);
                 } else {
                     if (!summary_bank.active() || txid != summary_bank.id) {
                         refuse_state("end requires active transaction identity"); continue;
@@ -15871,6 +15932,8 @@ int main(int argc, char** argv) {
                             std::printf("FATAL summary bank release failed\n"); std::fflush(stdout); return 1;
                         }
                     } catch (...) { std::printf("FATAL uncertain summary bank release\n"); std::fflush(stdout); return 1; }
+                    if (summary_clone_positions) cudaFree(summary_clone_positions);
+                    summary_clone_positions = nullptr; summary_bank_cloned = false;
                     summary_bank_live.clear(); summary_bank_imgs.clear(); summary_img_rows.clear(); summary_row_ptr.clear();
                     summary_checks.clear(); summary_conversations = strata::core::ConversationCache(0, 0);
                     summary_kva_floors.clear(); continuations[1] = {};
@@ -16043,7 +16106,7 @@ int main(int argc, char** argv) {
                     summary_img_rows.swap(img_rows);
                     summary_row_ptr.swap(row_ptr);
                     summary_mrope_identity = mrope_identity;
-                    summary_history_approximate = history_approximate; history_approximate = false;
+                    summary_history_approximate = history_approximate; history_approximate = state_fork && summary_history_approximate;
                     summary_has_embd_rows = sp.embd_rows != nullptr;
                     sp.embd_rows = nullptr;
                     summary_checks.swap(checks);

@@ -91,6 +91,29 @@ class Binding(unittest.TestCase):
             pins=server.prepare_summary_qualification_pins(self.cfg)
         engine=Engine();engine.spawn=(str(self.native),actual_args,str(self.root),None,{'STRATA_METAL_F16':'0'})
         self.cfg.update(pins);self.assertTrue(self.configure(a.SummaryLane(),engine))
+    def test_prelaunch_end_effort_binds_the_tokenizer_role_without_launching(self):
+        from serve import server
+        import json
+        from types import SimpleNamespace
+        import strata_tokenizer as ST
+        tokenizer=self.root/'tokenizer';tokenizer.mkdir()
+        for name,value in [('vocab.json', {'system':0}),('token_type.json',[1]),('tokenizer.json',{'pre':'qwen35'})]:
+            (tokenizer/name).write_text(json.dumps(value))
+        (tokenizer/'merges.txt').write_text('')
+        self.native.write_bytes(b'fake-native --tail-role-token')
+        cfg={**self.cfg,'tokenizer':str(tokenizer),'effort_position':'end'}
+        tok=SimpleNamespace(encode=lambda text,parse_special: [4321] if text=='system' and parse_special else [])
+        with patch.object(server,'apply_saved_tuning',side_effect=lambda cfg:cfg), patch.object(server,'with_component_engine',side_effect=lambda cfg:cfg), patch.object(server,'apply_vision_defaults',side_effect=lambda cfg:cfg), patch.object(server,'engine_args',return_value=list(cfg['args'])), patch.object(server,'child_env',return_value={}), patch.object(server,'configure_batch_telemetry_env'), patch.object(ST,'Tokenizer',return_value=tok), patch.object(server,'StrataEngine',side_effect=AssertionError('no launch')):
+            pins=server.prepare_summary_qualification_pins(cfg)
+        expected=SimpleNamespace(spawn=(str(self.native),cfg['args']+['--tail-role-token','4321'],str(self.root),None,{}))
+        self.assertEqual(pins,a.qualified_runtime_pins(a.runtime_qualification_config(cfg,expected)))
+        wrong=SimpleNamespace(spawn=(str(self.native),list(cfg['args']),str(self.root),None,{}))
+        self.assertNotEqual(pins,a.qualified_runtime_pins(a.runtime_qualification_config(cfg,wrong)))
+    def test_prelaunch_rejects_unknown_effort_position(self):
+        from serve import server
+        with patch.object(server,'apply_saved_tuning',side_effect=lambda cfg:cfg), patch.object(server,'with_component_engine',side_effect=lambda cfg:cfg), patch.object(server,'apply_vision_defaults',side_effect=lambda cfg:cfg):
+            with self.assertRaisesRegex(ValueError,'effort_position'):
+                server.prepare_summary_qualification_pins({**self.cfg,'effort_position':'unknown'})
     def test_mock_startup_reaches_http_boundary_without_strata_locals(self):
         from serve import server
         class ReachedHTTP(Exception):pass
