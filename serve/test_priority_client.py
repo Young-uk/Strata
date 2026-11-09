@@ -51,6 +51,30 @@ class ClientTests(unittest.TestCase):
         self.cancel._priority_owner = self.owner
         self.client = ContinuationClient(self.e, self.s, self.lane)
 
+    def test_serial_recovery_appends_to_main_without_forking_a_bank(self):
+        self.s.close(self.owner)
+        self.owner = exhaust(self.s.admit(True, self.cancel, recovery=True))
+        self.cancel._priority_owner = self.owner
+        self.cancel._atomic_serial_recovery = {"ids": [1, 2], "tokens": 2, "tail": 3}
+        original = self.e._send_for
+        def send(generation, command):
+            identity = command.split()[1]
+            if command.startswith('ARECOVER '):
+                self.e.sent.append(command)
+                self.e.lines.put(f'AREADY {identity} 2 4')
+            elif command.startswith('ANEXT '):
+                self.e.sent.append(command)
+                self.e.lines.put(f'AT {identity} 101')
+                self.e.lines.put(f'ADONE {identity} length 1')
+            else:
+                original(generation, command)
+        self.e._send_for = send
+        self.assertEqual(list(self.client.generate([4], 1, {}, self.cancel)), [101])
+        self.assertTrue(self.e.sent[0].startswith('ARECOVER '))
+        self.assertIn(' main 1 ', self.e.sent[0])
+        self.assertTrue(self.e.sent[0].endswith('1,2,3,4'))
+        self.assertFalse(any(command.startswith('AFORK ') for command in self.e.sent))
+
     def test_capability_exact(self): self.client.discover()
 
     def test_two_tokens_no_stop_or_replay(self):

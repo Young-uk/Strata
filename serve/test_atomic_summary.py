@@ -291,6 +291,93 @@ class Api(unittest.TestCase):
                 self.assertNotIn("generate", self.engine.calls)
                 self.assertFalse(self.svc.summary_lane.poisoned)
 
+    def test_clean_memory_refusal_keeps_bound_cache_for_retry(self):
+        receipt = {"owner": "thread/turn", "tokens": 3, "hash": 7, "ids": [1,2,3], "tail": 4}
+        self.engine.atomic_main_snapshot = receipt
+        def state(action, *args, **kwargs):
+            if action == 'caps':
+                return True
+            refusal = SessionRefused('memory', 'normal pressure, stable swap and RAM floor required')
+            refusal.summary_refused = True
+            raise refusal
+        self.engine.summary_state = state
+        self.svc.summary_lane.configure_state_bank(self.engine, 1000)
+        self.svc.summary_lane.clone_enabled = True
+        payload = {**BODY, "atomic_summary_clone":"thread/turn"}
+        for _ in range(2):
+            status, body = self.call('/v1/chat/completions', payload)
+            self.assertEqual(status, 409, body)
+            self.assertEqual(body['error']['code'], 'atomic_summary_admission_refused')
+            self.assertIs(self.engine.atomic_main_snapshot, receipt)
+        self.assertNotIn('generate', self.engine.calls)
+
+    def test_native_app_cache_receipt_and_plan_refuse_foreign_origins(self):
+        for origin, expected in (("tauri://localhost", 200), ("http://tauri.localhost", 200),
+                                 ("https://tauri.localhost", 200), ("https://untrusted.invalid", 403)):
+            for path, payload in (("history-plan", {"owner":"thread/turn", "candidates": []}),
+                                  ("cache-receipt", {"owner":"thread/turn", "history_hash":"f" * 64})):
+                self.engine.atomic_main_snapshot = {"owner":"thread/turn"}
+                conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=10)
+                try:
+                    conn.request("POST", "/v1/atomic/" + path, json.dumps(payload),
+                                 {"Content-Type":"application/json", "Origin":origin})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, expected)
+                    response.read()
+                    if path == "cache-receipt":
+                        self.assertEqual(self.engine.atomic_main_snapshot.get("history_hash"),
+                                         "f" * 64 if expected == 200 else None)
+                finally:
+                    conn.close()
+
+    def test_image_counter_matches_prepared_generation_and_reuses_embedding(self):
+        from serve.test_server import ImageMarkers
+        from serve.server import Vision
+        class Cached(ImageMarkers.FakeVision):
+            def __init__(self, directory):
+                super().__init__(directory)
+                self.cache = {}
+                self.encodes = 0
+            def encode_all(self, sources, cancel=None):
+                out = []
+                for source in sources:
+                    key = Vision.load(source)
+                    if key not in self.cache:
+                        self.cache[key] = (self.rows, 7)
+                        self.encodes += 1
+                    out.append(self.cache[key])
+                return out
+            def all_cached(self, sources):
+                return all(Vision.load(source) in self.cache for source in sources)
+        self.svc.vision = Cached(self.tmp.name)
+        payload = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "literal <|image_pad|> is text"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgpkYXRh"}}]}], "think": False}
+        with patch.object(self.svc, "_vision_up"):
+            status, counted = self.call("/v1/atomic/prompt-token-count", payload)
+            self.assertEqual(status, 200, counted)
+            messages, tools, kwargs = openai_to_messages({**payload, "messages": counted["prepared_messages"]})
+            ids, _, _ = self.svc.prepare(messages, tools, kwargs, 32)
+            self.assertEqual(len(ids), counted["input_tokens"])
+            self.assertEqual(self.svc.vision.encodes, 1)
+            self.svc.embeddings.path.unlink(missing_ok=True)
+        self.assertEqual(self.engine.calls, [])
+
+    def test_foreground_count_preserves_template_tools_and_oversized_input(self):
+        payload = {"messages": [{"role": "user", "content": "hello" * 14000}],
+                   "tools": [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}],
+                   "atomic_output_reserve": 1024, "think": False}
+        messages, tools, kw = openai_to_messages(self.svc.with_shared(payload, "openai"))
+        expected = len(self.svc.encode_prompt(messages, tools, kw, store=False))
+        with patch.object(self.svc, "encode_prompt", wraps=self.svc.encode_prompt) as encode:
+            status, counted = self.call("/v1/atomic/prompt-token-count", payload)
+            self.assertEqual(status, 200, counted)
+            self.assertEqual(counted["input_tokens"], expected)
+            self.assertEqual(counted["context_length"], 65536)
+            self.assertEqual(counted["reserved_tokens"], 1032)
+            self.assertFalse(encode.call_args.kwargs["store"])
+        self.assertEqual(self.engine.calls, [])
+
     def test_count_matches_template_without_engine_or_storing(self):
         normalized = request(BODY, count=True)
         messages, tools, kw = openai_to_messages(normalized)

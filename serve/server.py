@@ -6404,7 +6404,8 @@ class Service:
                 else:
                     deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
                     admission = scheduler.admit(sampling.get("atomic_summary") is True, cancel, deadline,
-                                                recovery=sampling.get("atomic_summary_recovery") is True)
+                                                recovery=sampling.get("atomic_summary_recovery") is True,
+                                                scheduled=sampling.get("atomic_background_task") is True)
                     waiting_id = uuid.uuid4().hex[:12]
                     admitted = False
                     cancel._priority_queued_at = time.time()
@@ -6652,10 +6653,12 @@ class Service:
                             cancel._atomic_clone_snapshot = dict(snapshot)
                         try:
                             turn.enter_context(self.summary_lane.transaction(self.engine, cancel))
-                        except BaseException:
-                            # A refused restored receipt must not trap every
-                            # retry before the next foreground cache can warm.
-                            if clone_owner is not None and getattr(self.engine, "atomic_main_snapshot", None) is snapshot:
+                        except BaseException as exc:
+                            # Clean memory refusal leaves the frozen main valid.
+                            # Keep its receipt for the waiting summary's retry.
+                            # Stale/uncertain transitions still invalidate it.
+                            if (not getattr(exc, "preserve_clone", False) and clone_owner is not None and
+                                    getattr(self.engine, "atomic_main_snapshot", None) is snapshot):
                                 self.engine.atomic_main_snapshot = None
                             raise
                     before = getattr(self.engine, "last", None)
@@ -8654,7 +8657,7 @@ def make_handler(svc: Service):
                         return
                     self._json(200, {"atomic_summary": svc.summary_switch_resume()})
                 elif path == "/v1/atomic/history-plan":
-                    if not self._own_page("retained conversation boundaries can be checked"):
+                    if not self._atomic_cache_page("retained conversation boundaries can be checked"):
                         return
                     from serve.history_plan import choose_boundary
                     snapshot = getattr(svc.engine, "atomic_main_snapshot", None)
@@ -8672,7 +8675,7 @@ def make_handler(svc: Service):
                         result = {"boundary": None, "reason": "cache-changed"}
                     self._json(200, result)
                 elif path == "/v1/atomic/cache-receipt":
-                    if not self._own_page("a completed cache history receipt can be recorded"):
+                    if not self._atomic_cache_page("a completed cache history receipt can be recorded"):
                         return
                     owner, history_hash = req.get("owner"), req.get("history_hash")
                     if not isinstance(owner, str) or not isinstance(history_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", history_hash):
@@ -8684,6 +8687,8 @@ def make_handler(svc: Service):
                     # replaces it, never resurrect that old snapshot object.
                     snapshot["history_hash"] = history_hash
                     self._json(200, {"saved": getattr(svc.engine, "atomic_main_snapshot", None) is snapshot})
+                elif path == "/v1/atomic/prompt-token-count":
+                    self._prompt_count_tokens(req)
                 elif path == "/v1/atomic/summary-token-count":
                     self._summary_count_tokens(req)
                 elif path == "/v1/messages/count_tokens":
@@ -8858,6 +8863,16 @@ def make_handler(svc: Service):
                 return False
             return self._own_page("summary scheduling can be changed")
 
+        def _atomic_cache_page(self, what) -> bool:
+            # The managed app HTTP bridge retains its webview Origin. Scope
+            # this exception to cache planning/receipts, never settings/tools.
+            origin = (self.headers.get("Origin") or "").rstrip("/")
+            if (svc.atomic_owner_key and origin in (
+                    "tauri://localhost", "http://tauri.localhost", "https://tauri.localhost")
+                    and self.headers.get("Content-Type", "").startswith("application/json")):
+                return True
+            return self._own_page(what)
+
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
             server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
@@ -9002,6 +9017,9 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
+            if "atomic_background_task" in req and (type(req["atomic_background_task"]) is not bool or
+                    (req["atomic_background_task"] and req.get("atomic_summary") is not True)):
+                raise ValueError("atomic_background_task requires a boolean on a summary request")
             if "atomic_summary_recovery" in req and (type(req["atomic_summary_recovery"]) is not bool or
                     (req["atomic_summary_recovery"] and req.get("atomic_summary") is not True)):
                 raise ValueError("atomic_summary_recovery requires a boolean on a summary request")
@@ -9281,6 +9299,96 @@ def make_handler(svc: Service):
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
+
+        def _prompt_count_tokens(self, req):
+            # Preserve the foreground template and tool catalogue; never turn
+            # this into a summary request or touch recurrent inference state.
+            if req.get("atomic_summary") is True:
+                raise ValueError("foreground token counting requires a foreground request")
+            req = svc.with_shared(req, "openai")
+            if req.get("model") not in (None, *svc.model_names()):
+                raise ValueError("model not found")
+            messages, tools, kw = openai_to_messages(req)
+            require_messages(messages)
+            self._no_local_images(messages)
+            prepared_messages = None
+            if images_of(messages):
+                if svc.vision is None:
+                    raise ValueError("this server was started without the vision encoder")
+                # Bind remote/local images to immutable bytes for BOTH counting
+                # and generation. The client sends these prepared messages next.
+                wire = json.loads(json.dumps(req.get("messages")))
+                for message in wire:
+                    if not isinstance(message.get("content"), list):
+                        continue
+                    for item in message["content"]:
+                        if item.get("type") != "image_url":
+                            continue
+                        value = item.get("image_url")
+                        source = value.get("url") if isinstance(value, dict) else value
+                        if not isinstance(source, str):
+                            raise ValueError("invalid image URL")
+                        if svc.offline and source.startswith(("http://", "https://")):
+                            raise ValueError("offline mode cannot download an image URL")
+                        data = Vision.normalize(Vision.load(source))
+                        url = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+                        item["image_url"] = {**value, "url": url} if isinstance(value, dict) else {"url": url}
+                req = {**req, "messages": wire}
+                prepared_messages = wire
+                messages, tools, kw = openai_to_messages(req)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":
+                tools = None
+            if req.get("strata_mcp"):
+                raise ValueError("exact counting of dynamic server tools is unavailable")
+            force = svc.force_text(forced_call(req.get("tool_choice"), tools))
+            messages, validator = prepare_format(req.get("response_format"), messages)
+            if validator is not None and tools:
+                raise ValueError("structured response_format with tools is not supported")
+            ids = svc.encode_prompt(messages, tools, kw, store=False)
+            if force and kw.get("enable_thinking", True) is False:
+                ids = ids + svc.tok.encode(force, parse_special=True)
+            sources = images_of(messages)
+            if sources:
+                if isinstance(svc.vision, DsPictures):
+                    from serve.ds_pictures import span_length
+                    counts = []
+                    for source in sources:
+                        w, h, _ = svc.vision.prepare(Vision.load(source))
+                        counts.append(span_length(w, h, svc.vision.patch, svc.vision.merge))
+                    positions = [j for j, token in enumerate(ids) if token == svc.vision.image_token]
+                    if len(positions) != len(counts):
+                        raise ValueError("the prompt and its images do not match")
+                    input_tokens = len(ids) + sum(counts) - len(counts)
+                else:
+                    # Image preparation runs once on the existing image FIFO.
+                    # Generation reuses its cached embedding and token count.
+                    with svc._turn():
+                        if not (hasattr(svc.vision, "all_cached") and svc.vision.all_cached(sources)):
+                            svc._vision_up()
+                        encoded = svc.vision.encode_all(sources) if hasattr(svc.vision, "encode_all") else [svc.vision.encode(src) for src in sources]
+                        svc.last_image_at = time.time()
+                    pad = svc.tok.encode(IMAGE_PAD, parse_special=True)[0]
+                    start = svc.tok.encode(VISION_START, parse_special=True)[0]
+                    literal = svc.tok.encode(IMAGE_PAD, parse_special=False)
+                    input_tokens, used = 0, 0
+                    for j, token in enumerate(ids):
+                        if token == pad and j > 0 and ids[j - 1] == start:
+                            if used >= len(encoded):
+                                raise ValueError("the prompt and its images do not match")
+                            input_tokens += encoded[used][1]
+                            used += 1
+                        else:
+                            input_tokens += len(literal) if token == pad else 1
+                    if used != len(encoded):
+                        raise ValueError("the prompt and its images do not match")
+            else:
+                input_tokens = len(ids)
+            reserve = req.get("atomic_output_reserve", 0)
+            if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
+                raise ValueError("invalid output reserve")
+            self._json(200, {"input_tokens": input_tokens, "context_length": svc.reported_ctx(),
+                             "reserved_tokens": reserve + CTX_SLACK,
+                             **({"prepared_messages": prepared_messages} if prepared_messages is not None else {})})
 
         def _summary_count_tokens(self, req):
             req = atomic_summary.request(req, count=True)

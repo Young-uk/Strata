@@ -31,6 +31,7 @@ class Owner:
     closed: bool = False
     turns: int = 0
     recovery: bool = False
+    scheduled: bool = False
 
 
 class WeightedScheduler:
@@ -50,6 +51,7 @@ class WeightedScheduler:
         self.owners = {False: None, True: None}
         self.waiters = {False: [], True: []}
         self.turn_owner = None
+        self.exclusive_owner = None
         self.foreground_turns = 0
         self.poison_reason = None
 
@@ -62,8 +64,8 @@ class WeightedScheduler:
         if self.poison_reason:
             raise PriorityError("native continuation ownership is uncertain; restart required")
 
-    def admit(self, summary, cancel, deadline=None, *, recovery=False):
-        owner = Owner(bool(summary), cancel, recovery=bool(summary and recovery))
+    def admit(self, summary, cancel, deadline=None, *, recovery=False, scheduled=False):
+        owner = Owner(bool(summary), cancel, recovery=bool(summary and recovery), scheduled=bool(summary and scheduled))
         with self.cv:
             self._check()
             self.waiters[owner.summary].append(owner)
@@ -90,6 +92,8 @@ class WeightedScheduler:
                 self.cv.notify_all()
 
     def _next(self):
+        if self.exclusive_owner is not None:
+            return self.exclusive_owner if self.exclusive_owner.ready else None
         fg, bg = self.owners[False], self.owners[True]
         fg = fg if fg and fg.ready and not fg.closed else None
         bg = bg if bg and bg.ready and not bg.closed else None
@@ -191,7 +195,9 @@ class WeightedScheduler:
                 return 2048
             foreground = self.owners[False]
             waiting = any(not item.cancel.is_set() for item in self.waiters[False])
-            return 1 if (foreground is not None and not foreground.closed) or waiting else 2048 if cached else 128
+            if (foreground is not None and not foreground.closed) or waiting:
+                return 512 if owner.scheduled else 1
+            return 2048
 
     def close(self, owner):
         with self.cv:

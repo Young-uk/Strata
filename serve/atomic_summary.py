@@ -7,6 +7,7 @@ subsequent GEN can repair a partially restored conversation.
 from __future__ import annotations
 
 import contextlib
+import gc
 import functools
 import re
 import hashlib
@@ -36,6 +37,8 @@ def request(req, *, count=False):
     if "atomic_summary_clone" in req and (not isinstance(req["atomic_summary_clone"], str) or
         re.fullmatch(r"[A-Za-z0-9_:/.-]{1,256}", req["atomic_summary_clone"]) is None):
         raise ValueError("invalid cached summary owner")
+    if "atomic_background_task" in req and type(req["atomic_background_task"]) is not bool:
+        raise ValueError("atomic_background_task must be a boolean")
     if "atomic_summary_recovery" in req and type(req["atomic_summary_recovery"]) is not bool:
         raise ValueError("atomic_summary_recovery must be a boolean")
     if req.get("tools") or req.get("strata_mcp") or req.get("response_format"):
@@ -231,6 +234,7 @@ def configure_optional_lane(lane, engine, cfg, *, engine_name, arch, groups=Fals
                 raise ValueError("unsupported_summary_state_bank_provenance")
             lane.configure_state_bank(engine, cfg.get("atomic_summary_state_bank_max_bytes"),
                 binding_check=lambda: qualification_mismatch(runtime_qualification_config(cfg, engine)))
+            lane.disk_recovery_enabled = cfg.get("atomic_summary_disk_recovery_enabled") is True
             return True
         directory = cfg.get("atomic_summary_snapshot_path")
         if not isinstance(directory, str) or not os.path.isabs(directory):
@@ -415,6 +419,78 @@ class SummaryLane:
                     self.foreground -= 1
 
     @contextlib.contextmanager
+    def serial_recovery(self, engine, cancel):
+        """Emergency single-state work, sealed by a verified disk rollback.
+
+        Only a bound complete token receipt qualifies. Never replay partial or
+        guessed history, and never overlap another foreground continuation.
+        """
+        scheduler = self.scheduler
+        owner = getattr(cancel, "_priority_owner", None)
+        snapshot = getattr(cancel, "_atomic_clone_snapshot", None)
+        if not scheduler or not owner or not owner.recovery or not snapshot or                 not isinstance(snapshot.get("ids"), list) or len(snapshot["ids"]) != snapshot.get("tokens"):
+            raise SummaryError("A complete current conversation cache is required for disk recovery; originals retained", 409,
+                               "atomic_summary_admission_refused")
+        path = None
+        saved = None
+        held = False
+        restored = False
+        try:
+            with scheduler.control(owner):
+                with scheduler.cv:
+                    foreground = scheduler.owners[False]
+                    if foreground is not None and not foreground.closed:
+                        raise SummaryError("Recovery is waiting for the active conversation to finish; originals retained", 409,
+                                           "atomic_summary_admission_refused")
+                    scheduler.exclusive_owner = owner
+                    held = True
+                current = getattr(engine, "atomic_main_snapshot", None)
+                if current is not None and any(current.get(key) != snapshot.get(key) for key in ("owner", "tokens", "hash")):
+                    raise SummaryError("Conversation cache changed before disk recovery; originals retained", 409,
+                                       "atomic_summary_clone_stale")
+                fd, path = tempfile.mkstemp(prefix="atomic-recovery-", suffix=".session")
+                os.close(fd)
+                self.phase = "saving"
+                self.transaction_mode = "serial-disk-recovery"
+                saved = engine.session_file("save", path)
+                if saved.get("tokens") != snapshot["tokens"] or saved.get("bytes", 0) <= 0:
+                    raise ValueError("recovery snapshot does not match the bound main cache")
+                cancel._atomic_serial_recovery = snapshot
+                self.transaction_mode = "serial-disk-recovery"
+                self.phase = "generating"
+            try:
+                yield
+            finally:
+                self.phase = "restoring"
+                with scheduler.control(owner, cleanup=True):
+                    ended = engine.session_file("restore", path)
+                    if (ended.get("tokens"), ended.get("bytes")) != (saved["tokens"], saved["bytes"]):
+                        raise ValueError("recovery rollback identity mismatch")
+                    restored = True
+        except BaseException as exc:
+            # A failed SAVE never selected a different main. Once SAVE succeeded,
+            # any uncertain outcome keeps the artifact and blocks further work.
+            clean_refusal = saved is None and getattr(exc, "published", None) is False
+            if (saved is not None and not restored) or (saved is None and path and not clean_refusal):
+                self.poisoned, self.recovery_path = True, path
+                scheduler.poison("serial recovery rollback is uncertain")
+                raise SummaryError("Disk recovery could not restore the original state; snapshot retained and inference blocked",
+                                   code="atomic_summary_recovery_required") from exc
+            raise
+        finally:
+            if hasattr(cancel, "_atomic_serial_recovery"):
+                del cancel._atomic_serial_recovery
+            if held and not self.poisoned:
+                with scheduler.cv:
+                    scheduler.exclusive_owner = None
+                    scheduler.cv.notify_all()
+            if path and not self.poisoned:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    @contextlib.contextmanager
     def transaction(self, engine, cancel):
         """Caller owns the engine FIFO. Rollback completes before FIFO release."""
         if self.binding_check is not None:
@@ -516,14 +592,27 @@ class SummaryLane:
                     "pressure or memory refused shared resource preparation",
                 }
                 reason = str(exc)
+                if reason in memory_refusals or reason in refusal_messages:
+                    # Collect only unreachable Python request objects. Live
+                    # conversation/vision/cache owners are never discarded.
+                    gc.collect()
+                owner = getattr(cancel, "_priority_owner", None)
+                if (getattr(exc, "summary_refused", False) and owner is not None and owner.recovery and getattr(self, "disk_recovery_enabled", False) and
+                        (reason in memory_refusals or reason in refusal_messages)):
+                    with self.serial_recovery(engine, cancel):
+                        yield
+                    return
                 message = refusal_messages.get(reason, "Summary is waiting for normal memory pressure, stable swap and available RAM; originals retained"
                     if reason in memory_refusals else "summary state could not be established; main conversation preserved")
-                raise SummaryError(message
+                failure = SummaryError(message
                                    if getattr(exc, "summary_refused", False) else
                                    "summary begin outcome is uncertain; inference blocked pending recovery",
                                    409 if getattr(exc, "summary_refused", False) else 503,
                                    "atomic_summary_admission_refused" if getattr(exc, "summary_refused", False) else
-                                   "atomic_summary_recovery_required") from exc
+                                   "atomic_summary_recovery_required")
+                failure.preserve_clone = bool(getattr(exc, "summary_refused", False) and
+                                              (reason in memory_refusals or reason in refusal_messages))
+                raise failure from exc
             with self.lock:
                 self.phase = "generating"
             try:

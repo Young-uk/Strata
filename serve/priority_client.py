@@ -106,7 +106,7 @@ class ContinuationClient:
             if self._sync_read() != self.PREP_CAPS:
                 raise ValueError("native legacy-preparation continuation protocol unavailable")
             if self.idle_summary_inputs:
-                print("[strata] summary input quanta: idle=128, foreground-pending=1, decode=1", flush=True)
+                print("[strata] summary input quanta: idle=native-max, foreground-pending=1, scheduled-foreground=512, decode=1", flush=True)
 
     def _sampling_keys(self, sampling):
         keys = self.engine.sampling_keys(sampling or {}).strip().split()
@@ -223,7 +223,10 @@ class ContinuationClient:
         produced = committed = 0
         totals = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": None,
                   "decode_ms": None, "reused": 0, "prompt_read": 0, "finish": "cancel"}
-        clone = getattr(cancel, "_atomic_clone_snapshot", None) if owner.summary else None
+        serial = getattr(cancel, "_atomic_serial_recovery", None) if owner.summary else None
+        clone = getattr(cancel, "_atomic_clone_snapshot", None) if owner.summary and not serial else None
+        if serial:
+            ids = [*serial["ids"], serial["tail"], *ids]
         # Previously only finished text requests were recorded. Interrupted work must
         # invalidate the former owner before it can be mistaken for this cache.
         # Completed GENI tokens and positions are copied by the native fork;
@@ -261,7 +264,7 @@ class ContinuationClient:
                         in_flight = "admission"
                         try:
                             self.engine._send_for(self.generation,
-                                f"{'AFORK' if clone else 'AGEN'} {identity} {'summary' if owner.summary else 'main'} {max_new} " +
+                                f"{'ARECOVER' if serial else 'AFORK' if clone else 'AGEN'} {identity} {'summary' if owner.summary and not serial else 'main'} {max_new} " +
                                 (keys + " " if keys else "") + ",".join(str(int(t)) for t in ids))
                         except BaseException as exc:
                             raise self.poison("native admission write outcome is uncertain") from exc
@@ -363,7 +366,7 @@ class ContinuationClient:
                         in_flight = "quantum"
                         try:
                             # A foreground arrival after this decision waits for at most
-                            # 128 committed summary inputs, then the ordinary weighted turn.
+                            # the negotiated native input block, then the ordinary weighted turn.
                             budget = (min(self.summary_max_inputs, self.scheduler.summary_input_quantum(owner, cached=True) if clone else self.scheduler.summary_input_quantum(owner))
                                       if owner.summary and self.idle_summary_inputs else None)
                             suffix = f" {budget}" if budget is not None else ""

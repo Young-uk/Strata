@@ -8,10 +8,10 @@ from serve.test_priority_client import Engine
 from serve.test_priority_scheduler import exhaust
 
 class InputBudget(unittest.TestCase):
-    def fixture(self, foreground=False, modern=True):
+    def fixture(self, foreground=False, modern=True, scheduled=False):
         engine=Engine();scheduler=WeightedScheduler(threading.Lock());lane=SummaryLane()
         if foreground:exhaust(scheduler.admit(False,threading.Event()))
-        cancel=threading.Event();owner=exhaust(scheduler.admit(True,cancel));cancel._priority_owner=owner
+        cancel=threading.Event();owner=exhaust(scheduler.admit(True,cancel,scheduled=scheduled));cancel._priority_owner=owner
         client=ContinuationClient(engine,scheduler,lane)
         if modern:
             send=engine._send_for
@@ -22,7 +22,7 @@ class InputBudget(unittest.TestCase):
             engine._send_for=modern_send
         client.discover()
         return engine,scheduler,client,cancel,owner
-    def test_idle_summary_negotiates_128_input_turn(self):
+    def test_idle_summary_uses_native_input_capacity(self):
         e,s,c,cancel,owner=self.fixture()
         output=list(c.generate([1,2,3],2,{},cancel))
         self.assertEqual(output,[101,102])
@@ -39,11 +39,11 @@ class InputBudget(unittest.TestCase):
         self.assertTrue(all(len(x.split())==2 for x in e.sent if x.startswith('ANEXT')))
     def test_arrival_changes_next_quantum_without_cancelling_summary(self):
         e,s,c,cancel,bg=self.fixture()
-        release=exhaust(s.turn(bg));self.assertEqual(s.summary_input_quantum(bg),128);release()
+        release=exhaust(s.turn(bg));self.assertEqual(s.summary_input_quantum(bg),2048);release()
         fg=exhaust(s.admit(False,threading.Event()))
         release=exhaust(s.turn(bg));self.assertEqual(s.summary_input_quantum(bg),1);release()
         s.close(fg)
-        release=exhaust(s.turn(bg));self.assertEqual(s.summary_input_quantum(bg),128);release()
+        release=exhaust(s.turn(bg));self.assertEqual(s.summary_input_quantum(bg),2048);release()
         self.assertFalse(cancel.is_set());self.assertFalse(bg.closed)
     def test_waiting_foreground_reduces_budget(self):
         e,s,c,cancel,bg=self.fixture()
@@ -53,4 +53,15 @@ class InputBudget(unittest.TestCase):
         e,s,c,cancel,bg=self.fixture()
         with self.assertRaises(PriorityError):s.summary_input_quantum(bg)
 
-if __name__=='__main__':unittest.main()
+    def test_current_native_summary_has_no_legacy_idle_cap(self):
+        e,s,c,cancel,bg=self.fixture()
+        c.summary_max_inputs=2048
+        self.assertEqual(list(c.generate([1,2,3],2,{},cancel)),[101,102])
+        self.assertEqual([x.split()[-1] for x in e.sent if x.startswith('ANEXT')],['2048','2048'])
+    def test_scheduled_input_progresses_during_foreground_chat(self):
+        e,s,c,cancel,bg=self.fixture(foreground=True,scheduled=True)
+        c.summary_max_inputs=2048
+        self.assertEqual(list(c.generate([1,2,3],2,{},cancel)),[101,102])
+        self.assertEqual([x.split()[-1] for x in e.sent if x.startswith('ANEXT')],['512','512'])
+
+if __name__=='__main__' :unittest.main()

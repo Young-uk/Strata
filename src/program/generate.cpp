@@ -11977,6 +11977,7 @@ int main(int argc, char** argv) {
         strata::core::SummaryTransaction summary_tx;
         strata::core::SummaryStateBank summary_bank;
         strata::core::NativeContinuation continuations[2];
+        std::string serial_recovery_id;
         bool continuation_summary_selected = false, summary_bank_nan = false;
         bool summary_bank_cloned = false;
         uint64_t summary_clone_next_position = 0;
@@ -15508,7 +15509,8 @@ int main(int argc, char** argv) {
                 std::fflush(stdout); continue;
             }
             const bool afork = line.rfind("AFORK ", 0) == 0;
-            const bool ainit = line.rfind("AGEN ", 0) == 0 || afork;
+            const bool arecover = line.rfind("ARECOVER ", 0) == 0;
+            const bool ainit = line.rfind("AGEN ", 0) == 0 || afork || arecover;
             const bool astep = line.rfind("ANEXT ", 0) == 0;
             const bool acancel = line.rfind("ACANCEL ", 0) == 0;
             if (ainit || astep || acancel) {
@@ -15518,7 +15520,7 @@ int main(int argc, char** argv) {
                 };
                 if (ainit) {
                     strata::core::NativeContinuation incoming;
-                    if (!strata::core::NativeContinuation::parse(line.substr(afork ? 6 : 5), n_vocab, incoming, ae)) {
+                    if (!strata::core::NativeContinuation::parse(line.substr(arecover ? 9 : afork ? 6 : 5), n_vocab, incoming, ae)) {
                         refused("arguments", ae); continue;
                     }
                     aid = incoming.id;
@@ -15528,6 +15530,22 @@ int main(int argc, char** argv) {
                     auto& c = continuations[incoming.summary ? 1 : 0];
                     if (c.active() || continuations[0].id == aid || continuations[1].id == aid) {
                         refused("busy", "lane or request identity already owned"); continue;
+                    }
+                    const bool recovery_prefix = arecover && !incoming.summary && !continuation_summary_selected &&
+                        !summary_bank.active() && live_ok && !live.empty() && live.size() < incoming.origin &&
+                        std::equal(live.begin(), live.end(), incoming.ids.begin());
+                    if (arecover && (!recovery_prefix || continuations[1].active())) {
+                        refused("recovery", "serial recovery requires the exact idle main prefix without a summary bank"); continue;
+                    }
+                    if (recovery_prefix && (uint64_t(incoming.ids.size()) + incoming.limit + 8 > uint64_t(o.max_context))) {
+                        refused("bounds", "serial recovery token headroom exhausted"); continue;
+                    }
+                    if (recovery_prefix) {
+                        const uint64_t next_position = d_mrope ? uint64_t(mrope_host[live.size()*3]) : live.size();
+                        if (!strata::core::SummaryStateBank::clone_room(next_position,
+                                incoming.ids.size() - live.size(), incoming.limit, (uint64_t)o.max_context)) {
+                            refused("bounds", "serial recovery absolute-position headroom exhausted"); continue;
+                        }
                     }
                     if (incoming.summary && !summary_bank.active()) {
                         refused("bank", "summary bank is not held"); continue;
@@ -15556,7 +15574,7 @@ int main(int argc, char** argv) {
                     // summary can run while an untouched main image context is held.
                     const bool target_image = incoming.summary == continuation_summary_selected
                         ? (!mrope_identity || !live_imgs.empty()) : (!summary_mrope_identity || !summary_bank_imgs.empty());
-                    if (target_image && !(afork && (continuation_summary_selected ? history_approximate : summary_history_approximate) &&
+                    if (target_image && !recovery_prefix && !(afork && (continuation_summary_selected ? history_approximate : summary_history_approximate) &&
                         (continuation_summary_selected ? live_imgs.empty() : summary_bank_imgs.empty()))) { refused("images", "v1 does not admit a foreground image context"); continue; }
                     const auto& target_live = incoming.summary == continuation_summary_selected ? live : summary_bank_live;
                     const bool target_ok = incoming.summary == continuation_summary_selected ? live_ok : summary_bank_live_ok;
@@ -15584,6 +15602,7 @@ int main(int argc, char** argv) {
                     if (strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"))) incoming.penalty_origin = 0;
                     live_ok = true; summary_pristine = false;
                     c = std::move(incoming);
+                    if (arecover) serial_recovery_id = c.id;
                     std::printf("AREADY %s %llu %llu\n", c.id.c_str(),
                         (unsigned long long)c.cursor, (unsigned long long)c.origin);
                     std::fflush(stdout); continue;
@@ -15616,7 +15635,10 @@ int main(int argc, char** argv) {
                     ~ContinuationBusy() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
                 } continuation_busy;
                 const bool prefill = c.prompt_remaining() != 0;
-                const size_t end = c.cursor + c.quantum_inputs(summary_inputs);
+                const bool serial_recovery = c.id == serial_recovery_id;
+                const size_t end = c.cursor + (serial_recovery && c.prompt_remaining()
+                    ? std::min<size_t>(std::clamp<size_t>(summary_inputs, 1, 2048), c.prompt_remaining())
+                    : c.quantum_inputs(summary_inputs));
                 ver.set_sampling(c.sampler);
                 if (!ver.set_logit_bias(c.bias, ae)) { std::printf("FATAL continuation sampler reset failed\n"); std::fflush(stdout); return 1; }
                 ver.set_head_sampling(!prefill);
@@ -15625,7 +15647,7 @@ int main(int argc, char** argv) {
                 int32_t next = -1;
                 bool batched_summary_prefill = false;
 #if defined(STRATA_GPU_METAL)
-                if (prefill && c.summary && summary_inputs > 1) {
+                if (prefill && (c.summary || serial_recovery) && summary_inputs > 1) {
                     // Use the existing prompt GEMM path on the selected summary
                     // bank. Repeating the tiny speculative verify window would
                     // still serialize input through matrix-vector kernels.
