@@ -118,3 +118,37 @@ class ReceiptApiTests(unittest.TestCase):
             self.assertEqual(fixture.engine.calls,[])
         finally:
             fixture.doCleanups()
+
+class ThreadOwnershipTests(unittest.TestCase):
+    setUp = DiskTests.setUp
+    service = DiskTests.service
+    def test_owner_is_independent_of_clone_receipts(self):
+        self.engine.atomic_disk_owner = 'room-a/turn'
+        self.cache.save(self.service())
+        record = json.loads(self.cache.manifest.read_text())
+        self.assertEqual(record['cache_owner'], 'room-a/turn')
+        self.assertNotIn('clone_binding', record)
+        self.assertEqual((self.cache.directory / (record['file'] + '.threads')).read_text(), 'room-a\n')
+        restored = Engine();self.cache.restore(restored)
+        self.assertEqual(restored.atomic_disk_owner, 'room-a/turn')
+
+    def test_deleted_owner_cannot_save_or_restore(self):
+        self.engine.atomic_disk_owner = 'room-a/turn'
+        self.cache.save(self.service())
+        markers=self.cache.directory/'.deleted-threads';markers.mkdir();(markers/'room-a').write_text('deleted')
+        calls=len(self.engine.calls)
+        self.assertIsNone(self.cache.save(self.service()))
+        self.assertIsNone(self.cache.restore(self.engine))
+        self.assertEqual(len(self.engine.calls),calls)
+
+    def test_deletion_during_native_save_cannot_resurrect_cache(self):
+        self.engine.atomic_disk_owner = 'room-a/turn'
+        original=self.engine.session_file
+        def delete_during_save(action,path):
+            result=original(action,path)
+            markers=self.cache.directory/'.deleted-threads';markers.mkdir();(markers/'room-a').write_text('deleted')
+            return result
+        self.engine.session_file=delete_during_save
+        self.assertIsNone(self.cache.save(self.service()))
+        self.assertFalse(self.cache.manifest.exists())
+        self.assertFalse(list(self.cache.directory.glob('*.session*')))

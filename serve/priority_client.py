@@ -228,7 +228,9 @@ class ContinuationClient:
         # invalidate the former owner before it can be mistaken for this cache.
         emitted = []
         cache_owner = sampling.get("atomic_cache_owner") if not owner.summary else None
-        if not owner.summary: self.engine.atomic_main_snapshot = None
+        if not owner.summary:
+            self.engine.atomic_main_snapshot = None
+            self.engine.atomic_disk_owner = cache_owner
         if clone:
             ids = [clone["tail"], *ids]
             totals["prompt_tokens"] = len(ids)

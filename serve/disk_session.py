@@ -31,6 +31,16 @@ class DiskSession:
         self.max_bytes = max_bytes
         self.manifest = self.directory / 'latest.json'
 
+    @staticmethod
+    def _thread(owner):
+        if not isinstance(owner, str):
+            return None
+        value = owner.split('/', 1)[0]
+        return value if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value) else None
+
+    def _deleted(self, thread):
+        return bool(thread and (self.directory / '.deleted-threads' / thread).exists())
+
     def _record(self, require_identity=True):
         if self.manifest.is_symlink():
             raise ValueError('session manifest is a symlink')
@@ -78,8 +88,9 @@ class DiskSession:
             record = self._record()
         except FileNotFoundError:
             return None
-        if not record:
+        if not record or self._deleted(self._thread(record.get('cache_owner'))):
             return None
+        engine.atomic_disk_owner = record.get('cache_owner')
         result = engine.session_file('restore', str(self.directory / record['file']))
         binding = self._binding(record.get('clone_binding'), result['tokens'])
         # The native FORK also checks the committed token count and token hash.
@@ -109,6 +120,10 @@ class DiskSession:
                 return self._save(service.engine)
 
     def _save(self, engine):
+        owner = getattr(engine, 'atomic_disk_owner', None) or (getattr(engine, 'atomic_main_snapshot', None) or {}).get('owner')
+        thread = self._thread(owner)
+        if self._deleted(thread):
+            return None
         name = uuid.uuid4().hex + '.session'
         path = self.directory / name
         old = None
@@ -124,6 +139,18 @@ class DiskSession:
                 raise ValueError('empty session or disk budget exceeded')
             os.chmod(path, 0o600)
             record = {'identity': self.identity, 'file': name, 'bytes': size, 'tokens': result['tokens']}
+            sidecar = self.directory / (name + '.threads')
+            if thread:
+                record['cache_owner'] = owner
+                with sidecar.open('x') as metadata:
+                    os.chmod(sidecar, 0o600)
+                    metadata.write(thread + '\n')
+                    metadata.flush()
+                    os.fsync(metadata.fileno())
+            if self._deleted(thread):
+                path.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+                return None
             binding = self._binding(getattr(engine, 'atomic_main_snapshot', None), result['tokens'])
             if binding:
                 record['clone_binding'] = binding
@@ -144,9 +171,21 @@ class DiskSession:
                     os.close(directory_fd)
             finally:
                 temp.unlink(missing_ok=True)
+            # The deletion marker may have arrived after the first check or
+            # manifest publication. Remove only our publication, never another.
+            if self._deleted(thread):
+                path.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+                try:
+                    if json.loads(self.manifest.read_text()).get('file') == name:
+                        self.manifest.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    pass
+                return None
             if old and old['file'] != name:
                 try:
                     (self.directory / old['file']).unlink(missing_ok=True)
+                    (self.directory / (old['file'] + '.threads')).unlink(missing_ok=True)
                 except OSError:
                     pass
             print(f"[strata] disk session saved: {result['tokens']} tokens, {size} bytes", flush=True)
@@ -155,4 +194,5 @@ class DiskSession:
             # Never invalidate the previous published checkpoint on a failed save.
             if not published:
                 path.unlink(missing_ok=True)
+                (self.directory / (name + '.threads')).unlink(missing_ok=True)
             raise
