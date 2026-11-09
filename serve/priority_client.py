@@ -12,15 +12,17 @@ from .priority import PriorityCancelled, PriorityError
 class ContinuationClient:
     CAPS = ["ASYNC_CAPS", "1", "512", "1", "text"]
     IDLE_CAPS = ["ASYNC_CAPS", "2", "512", "128", "text"]
+    RECOVERY_CAPS = ["ASYNC_CAPS", "3", "512", "2048", "text"]
     PREP_CAPS = ["APREP_CAPS", "1", "legacy1"]
     # This first native driver does not silently ignore unsupported GEN keys.
-    SUPPORTED_KEYS = {"temperature", "top_p", "top_k", "min_p", "penalty_last_n",
+    SUPPORTED_KEYS = {"history", "temperature", "top_p", "top_k", "min_p", "penalty_last_n",
                       "penalty_repeat", "penalty_freq", "penalty_present", "seed"}
 
     def __init__(self, engine, scheduler, lane):
         self.engine, self.scheduler, self.lane = engine, scheduler, lane
         self.generation = engine.gen
         self.idle_summary_inputs = False
+        self.summary_max_inputs = 1
 
     def poison(self, reason):
         self.scheduler.poison(reason)
@@ -96,9 +98,10 @@ class ContinuationClient:
         with self.engine._exclusive_control():
             self.engine._send_for(self.generation, "ASYNC_CAPS")
             capabilities = self._sync_read()
-            if capabilities not in (self.CAPS, self.IDLE_CAPS):
+            if capabilities not in (self.CAPS, self.IDLE_CAPS, self.RECOVERY_CAPS):
                 raise ValueError("native weighted continuation protocol unavailable")
-            self.idle_summary_inputs = capabilities == self.IDLE_CAPS
+            self.idle_summary_inputs = capabilities != self.CAPS
+            self.summary_max_inputs = int(capabilities[3])
             self.engine._send_for(self.generation, "APREP_CAPS")
             if self._sync_read() != self.PREP_CAPS:
                 raise ValueError("native legacy-preparation continuation protocol unavailable")
@@ -184,6 +187,7 @@ class ContinuationClient:
                         raise ValueError("wrong preparation prompt length")
                     self.engine.progress = (cursor, total)
                     self.engine.progress_ms = float(fields[3]) if len(fields) > 3 else 0
+                    cancel._atomic_input_progress = (cursor, total, getattr(cancel, "_atomic_input_cache", 0), int(self.engine.progress_ms))
                 except (ValueError, IndexError) as exc:
                     raise self.poison("invalid preparation progress") from exc
                 yield None
@@ -192,6 +196,7 @@ class ContinuationClient:
             elif fields[:1] in (["RESUME"], ["REUSED"]) and len(fields) == 2:
                 try:
                     self.engine.reused = self._number(fields[1], result["prompt_count"])
+                    cancel._atomic_input_cache = self.engine.reused
                 except ValueError as exc:
                     raise self.poison(str(exc)) from exc
             elif fields[:1] == ["ERR"]:
@@ -220,6 +225,8 @@ class ContinuationClient:
                   "decode_ms": None, "reused": 0, "prompt_read": 0, "finish": "cancel"}
         self.engine.last = {}
         self.engine.progress, self.engine.progress_ms = (0, len(ids)), 0
+        cancel._atomic_input_cache = 0
+        cancel._atomic_input_progress = (0, len(ids), 0, 0)
         started_sent = False
         def mark_started():
             nonlocal started_sent
@@ -263,6 +270,7 @@ class ContinuationClient:
                         totals["reused"] = committed
                         self.engine.progress = (committed, len(ids))
                         self.engine.reused = committed
+                        cancel._atomic_input_progress = (committed, len(ids), committed, 0)
                 finally:
                     try:
                         if in_flight and not self.scheduler.poison_reason:
@@ -338,7 +346,7 @@ class ContinuationClient:
                         try:
                             # A foreground arrival after this decision waits for at most
                             # 128 committed summary inputs, then the ordinary weighted turn.
-                            budget = (self.scheduler.summary_input_quantum(owner)
+                            budget = (min(self.summary_max_inputs, self.scheduler.summary_input_quantum(owner))
                                       if owner.summary and self.idle_summary_inputs else None)
                             suffix = f" {budget}" if budget is not None else ""
                             self.engine._send_for(self.generation, f"ANEXT {identity}{suffix}")
@@ -371,6 +379,7 @@ class ContinuationClient:
                                 in_flight = None
                                 committed, produced = cursor, count
                                 self.engine.progress = (min(committed, len(ids)), len(ids))
+                                cancel._atomic_input_progress = (min(committed, len(ids)), len(ids), totals["reused"], 0)
                                 break
                             if len(fields) == 4 and fields[0] == "ADONE" and fields[2] in ("stop", "length"):
                                 try:

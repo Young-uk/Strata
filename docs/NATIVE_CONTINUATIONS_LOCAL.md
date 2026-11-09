@@ -1,7 +1,6 @@
 # Experimental bounded native continuations
 
-Experimental implementation deployed in the personal v7 integration. The checks below
-do not establish real-model qualification. This does not
+Staged implementation only. Not installed or tested with a real model. This does not
 claim output parity, a latency improvement, or full legacy GEN feature coverage.
 
 ## Protocol 1
@@ -80,7 +79,7 @@ parity tests were run. CUDA, HIP and SYCL builds were not run.
 
 ## Foreground legacy admission: APREP 1
 
-This second, separately negotiated capability extends the experimental implementation.
+This second, separately negotiated capability extends the staged implementation.
 `APREP_CAPS` returns `APREP_CAPS 1 legacy1`, or version 0 if unavailable.
 
 `APREP <id> <max_total_output> <GEN|GENI> <legacy options/path/token list>` runs
@@ -116,10 +115,5 @@ completion may see active and must then cancel that matching continuation.
 The scope-exit APREPARED boundary also covers ordinary early returns/continues.
 A FATAL or process death still invalidates the process and is not a resumable
 admission refusal. No live-model, image conversation, cancellation-race or numerical
-parity test has been run for this extension. Local build artifacts and rollback backups are not included in this branch.
-
-## Protocol 2: bounded idle summary prefill
-
-The Metal personal integration advertises `ASYNC_CAPS 2 512 128 text` and accepts `ANEXT identity [1..128]`. Legacy `ANEXT identity` remains a single-input turn. The client negotiates the extension before sending a budget. While holding the serialized compute permit, it selects 128 summary inputs when no foreground owner or waiter exists, and one otherwise. Decode remains one input per turn. A foreground arrival waits at most the already-selected bounded quantum. Idle Metal prefill uses the existing batched prompt kernel and synchronizes before acknowledging the turn.
-
-The deployed Metal build compiled successfully. CPU parser, scheduler and fake-protocol tests cover negotiation, foreground arrivals, legacy behavior and invalid budgets. No new model inference prompts, output-parity comparison, CUDA, HIP or SYCL builds were run for this change. It remains an experimental personal integration.
+parity test has been run for this extension. Phase-one source backups are retained
+in the existing build-checks directory for rollback.

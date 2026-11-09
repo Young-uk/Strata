@@ -1,9 +1,5 @@
 # Conditional summary admission (local bounded release)
 
-This document describes the legacy protocol 3 serial transaction path.
-The v7 priority integration uses the separate protocol 5 contract documented in
-[PRIORITY_SCHEDULER_LOCAL.md](PRIORITY_SCHEDULER_LOCAL.md).
-
 This is a safety restriction on the opt-in serial summary transaction. It is not
 qualification of 64K rollback or a reservation of RAM. Foreground context stays
 65536. No OS memory limits, cache configuration, or model settings are changed.
@@ -65,9 +61,9 @@ snapshot. Keep qualification limits at measured values until those tests pass.
 Non-macOS platforms retain their existing memory admission; this change does not
 claim pressure/swap protection or backend validation there.
 
-## Experimental cache candidate
+## Private cache candidate
 
-The expanded text-cache shape is an experimental, unqualified candidate until paired
+The expanded text-cache shape is a private, unqualified candidate until paired
 live-model tests pass. A 1 GiB protected-byte envelope is a combined limit, not
 permission to retain 1 GiB of parked cache plus six main checkpoints. The
 configured cache budget excludes main checkpoints; the summary envelope counts

@@ -39,7 +39,7 @@ class Binding(unittest.TestCase):
         self.pin()
         for key in a.QUALIFICATION_PIN_KEYS:
             with self.subTest(key=key):
-                cfg=dict(self.cfg);cfg[key]=('strata-stat-v1:' if key.endswith('fingerprint') else '')+'0'*64
+                cfg=dict(self.cfg);cfg[key]=('strata-stat-v2:' if key.endswith('fingerprint') else '')+'0'*64
                 self.assertTrue(a.qualification_mismatch(cfg).startswith('changed_'))
     def test_native_change(self):
         self.pin();self.native.write_bytes(b'new-native');self.assertIn('native',a.qualification_mismatch(self.cfg))

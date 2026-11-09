@@ -1,3 +1,4 @@
+#include "history_cache.hpp"
 // metal/src/engine/window.cpp - the decode window on Metal: Verifier::init/run/commit's Metal side (the one backend
 // hook, src/core/verify.cpp under STRATA_GPU_METAL).  Everything above it - the decode loop, MTP control, the serve
 // protocol, the PLE table reads, the file tier - is the shared host code.
@@ -194,6 +195,7 @@ const int32_t* g_mrope_dev = nullptr;
 
 class Window {
 public:
+    bool history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err);
     bool summary_supported() const;
     bool continuation_supported() const;
     uint64_t summary_bytes() const;
@@ -770,7 +772,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     sg_ = A(4 * MAXT * 4); qfull_ = A(4 * MAXT * 12288); kcur_ = A(4 * MAXT * 512); vcur_ = A(4 * MAXT * 512);
     iqr_ = A(4 * MAXT * 512); ikr_ = A(4 * MAXT * 128); qcur_ = A(4 * MAXT * 24 * 256); qidx_ = A(4 * MAXT * 4 * 128);
     scores_ = A(4 * (size_t) MAXT * MB); qids_ = A(4 * MAXT * 2051); part_ = A(4 * (size_t) MAXT * 65 * 24 * 258);
-    cs_ = A(8 * (size_t) (MAXC + 16) * 32); lm_ = A(4 * (size_t) MAXT * n_vocab_); apv_ = A(4 * MAXT * 120);
+    cs_ = A(8 * (size_t) (4 * MAXC + 16) * 32); lm_ = A(4 * (size_t) MAXT * n_vocab_); apv_ = A(4 * MAXT * 120);
     api_ = A(4 * MAXT * 120); tokout_ = A(4 * MAXT); emb_ = A(4 * MAXT * N); pkey_ = A(4 * MAXT * 10240);
     pval_ = A(4 * MAXT * N);
     // the GDN layers' window inputs, kept per layer so commit() can fold the accepted prefix into the state
@@ -824,7 +826,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     // RoPE: cos/sin [pos][32] for the first 64 dims, NEOX pairs (i, i + 32), in double as build_rope_table
     const double base = f_.meta_num.count("qwen4exp.rope.freq_base") ? f_.meta_num["qwen4exp.rope.freq_base"] : 1e7;
-    for (int p = 0; p < MAXC + 16; ++p)
+    for (int p = 0; p < 4 * MAXC + 16; ++p)
         for (int i = 0; i < 32; ++i) {
             const double th = (double) p * std::pow(base, -2.0 * i / 64.0);
             cs_.as<float>()[(p * 32 + i) * 2] = (float) std::cos(th);
@@ -2139,11 +2141,31 @@ bool Window::summary_begin(strata::core::SessionState& ss, const std::function<b
     const char* ec = std::getenv("STRATA_METAL_PROMPT_CHUNK");
     const int C = std::max(64, std::min(8192, ec ? std::atoi(ec) : 2048));
     const char* eg = std::getenv("STRATA_METAL_PROMPT_GEMM");
-    if (!strata::core::SummaryStateBank::warmup_ready(stream_, st_ && st_->ready(),
-            !(eg && std::string(eg) == "0"), ep && std::string(ep) == "window", pg_ != nullptr, pb_.C, C)) {
-        err = "shared expert arena and prompt scratch must be warmed by a foreground request first"; return false;
-    }
     if (cut_ids_ != nullptr) { err = "prompt handshake is still active"; return false; }
+    auto resources_ready = [&]() {
+        return strata::core::SummaryStateBank::warmup_ready(stream_, st_ && st_->ready(),
+            !(eg && std::string(eg) == "0"), ep && std::string(ep) == "window", pg_ != nullptr, pb_.C, C);
+    };
+    auto prepare_resources = [&]() {
+        // Cold summary admission must not depend on a prior foreground GEN.
+        // Allocate the same expert arena and prompt scratch the foreground path
+        // uses; do not evaluate tokens or replace the selected main state.
+        if (pend_fold_ > 0 || pc_next_.valid()) {
+            err = "main prompt work is still pending before resource preparation"; return false;
+        }
+        if (!cx_->synchronize()) throw std::runtime_error("summary resource GPU quiescence failed");
+        if (stream_) {
+            if (st_->ready() && !st_->quiesce(err)) return false;
+            if (!st_->ready() && !stream_arena(err)) return false;
+            if (!(ep && std::string(ep) == "window") && !(eg && std::string(eg) == "0") &&
+                !prompt_gemm_init(err)) return false;
+        } else if (!(ep && std::string(ep) == "window") && !pc_setup(C)) {
+            err = "summary prompt scratch preparation failed"; return false;
+        }
+        std::fprintf(stderr, "strata summary state: shared resources prepared without foreground inference\n");
+        return true;
+    };
+    if (!strata::core::SummaryStateBank::prepare_resources(resources_ready, admit, prepare_resources, err)) return false;
     std::unique_ptr<SeqSet> candidate;
     try {
         candidate = std::make_unique<SeqSet>();
@@ -2455,6 +2477,39 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
         std::memcpy(c.dead.data() + j * dsz, dead_[j].ptr, dsz);
     }
     c.block_pos.assign(tail_.size() * sizeof(int32_t), 0);   // scratch on every backend: written before it is read
+    return true;
+}
+
+bool Window::history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err) {
+    if (!ready() || mtp_on_ || n_slots() || summary_is_selected() || prefix <= 0 || source <= prefix ||
+        length < 512 || prefix % 4 || source % 4 || length % 4 || source > max_cells_ - length) {
+        err = "history cache: unsupported state or unaligned indexer boundary"; return false;
+    }
+    for (size_t j = 0; j < kq_.size(); ++j) {
+        for (const auto& item : {std::pair<const mtl::Buffer*, size_t>{&kq_[j],512}, {&vq_[j],512}, {&ksc_[j],16}, {&vsc_[j],16}})
+            if (!item.first->ptr || !strata::history::rows_fit(item.first->bytes,item.second,prefix,source,length)) {
+                err = "history cache: KV extent mismatch"; return false;
+            }
+        if (!pooled_[j].ptr || !strata::history::rows_fit(pooled_[j].bytes,512,prefix/4,source/4,length/4)) {
+            err = "history cache: indexer extent mismatch"; return false;
+        }
+    }
+    // checkpoint_save settles the delayed recurrent fold before positional bytes move.
+    if (pend_fold_ > 0) {
+        std::vector<mtl::Dispatch> ds;
+        nb_ = false; fold(ds, pend_fold_, 1 - hp_); cx_->run_graph(ds); pend_fold_ = 0;
+    }
+    auto move = [&](mtl::Buffer& b, size_t stride) {
+        strata::history::compact_rows(b.ptr,b.bytes,stride,prefix,source,length);
+    };
+    for (size_t j = 0; j < kq_.size(); ++j) {
+        move(kq_[j], 512); move(vq_[j], 512); move(ksc_[j], 16); move(vsc_[j], 16);
+        strata::history::compact_rows(pooled_[j].ptr,pooled_[j].bytes,512,prefix/4,source/4,length/4);
+        std::memset(tail_[j].ptr, 0, 4 * 4 * 128);
+        // dead_ is the first token's key; the unchanged fixed prefix preserves it.
+    }
+    // GDN/PLE intentionally retain the removed history's influence: approximate, never exact replay.
+    last_T_ = 0; last_head_ = false;
     return true;
 }
 
@@ -3691,6 +3746,9 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
     Window* win = (Window*) w;
     if (!win->run(T, tokens, pos0, head || logpos, out, err)) return false;
     return !head || win->sample_rows(T, out, err);   // a sampled / penalised / biased request: the head rows' tokens by the sampler chain (nothing to do for greedy)
+}
+bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err) {
+    return g_the_window && g_the_window->history_compact(prefix, source, length, err);
 }
 bool window_summary_supported() { return g_the_window && g_the_window->summary_supported(); }
 bool window_continuation_supported() { return g_the_window && g_the_window->continuation_supported(); }

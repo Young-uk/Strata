@@ -32,6 +32,37 @@ class LaneTests(unittest.TestCase):
         with self.assertRaises(SummaryError) as e:
             with self.lane.transaction(self.engine,threading.Event()):pass
         self.assertEqual(e.exception.code,'atomic_summary_admission_refused');self.assertFalse(self.lane.poisoned)
+    def test_prepared_resource_refusal_rechecks_once_without_generation(self):
+        original = self.engine.summary_state
+        attempts = []
+        def admission(action, *args, **kwargs):
+            if action == 'begin':
+                attempts.append((args, kwargs))
+                if len(attempts) == 1:
+                    exc = SessionRefused('memory', 'pressure or memory changed during shared resource preparation')
+                    exc.summary_refused = True
+                    raise exc
+            return original(action, *args, **kwargs)
+        self.engine.summary_state = admission
+        with self.lane.transaction(self.engine, threading.Event()): pass
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(self.engine.calls, ['caps', 'begin', 'end'])
+        self.assertFalse(self.lane.poisoned)
+    def test_resource_retry_is_bounded_and_respects_cancel(self):
+        for cancelled in (False, True):
+            attempts = []; cancel = threading.Event()
+            def refusal(*args, **kwargs):
+                attempts.append(1)
+                if cancelled: cancel.set()
+                exc = SessionRefused('memory', 'pressure or memory changed during shared resource preparation')
+                exc.summary_refused = True
+                raise exc
+            self.engine.summary_state = refusal
+            with self.assertRaises(SummaryError):
+                with self.lane.transaction(self.engine, cancel): pass
+            self.assertEqual(len(attempts), 1 if cancelled else 2)
+            self.assertFalse(self.lane.poisoned)
     def test_uncertain_begin_and_end_poison(self):
         for mode in ('begin','end','mismatch'):
             engine=Bank();engine.fail=mode;lane=SummaryLane();lane.configure_state_bank(engine,1024)
@@ -61,6 +92,19 @@ class ProtocolTests(unittest.TestCase):
     def engine(self,lines):
         e=FakeEngine();e.max_context=65536;e.script=lines;return e
     def test_caps(self):self.assertTrue(self.engine(['SUMMARY_STATE_CAPS 4 16384\n']).summary_state('caps'))
+    def test_cold_caps_without_foreground(self):
+        engine = self.engine(['SUMMARY_STATE_CAPS 6 16384\n'])
+        self.assertTrue(engine.summary_state('caps'))
+        self.assertTrue(engine.summary_state_cold_start)
+        engine.script = ['SUMMARY_STATE_HELD cold 0 100 1\n']
+        held = engine.summary_state('begin', 'cold', max_slot_bytes=1024)
+        engine.script = ['SUMMARY_STATE_RELEASED cold 0 100 1\n']
+        self.assertEqual(held, engine.summary_state('end', 'cold'))
+        self.assertFalse(any(command.startswith(('GEN ', 'AGEN ')) for command in engine.proc.sent))
+    def test_legacy_caps_still_require_warmup(self):
+        engine = self.engine(['SUMMARY_STATE_CAPS 4 16384\n'])
+        self.assertTrue(engine.summary_state('caps'))
+        self.assertFalse(engine.summary_state_cold_start)
     def test_no_protocol_fallback(self):
         for text in ('SUMMARY_CAPS 3 16384','SUMMARY_STATE_CAPS 0 16384','SUMMARY_STATE_CAPS 4 8192'):
             with self.assertRaises(ValueError):self.engine([text+'\n']).summary_state('caps')
@@ -143,6 +187,13 @@ class Capabilities(unittest.TestCase):
             fixture.svc.atomic_completion_review_qualified=True
             status,body=fixture.call('/v1/models')
             self.assertEqual(status,200);self.assertTrue(body['atomic_summary_slot'])
+            self.assertFalse(body['atomic_summary_cold_start'])
+            fixture.engine.summary_state_cold_start = True
+            status, cold = fixture.call('/v1/models')
+            self.assertEqual(cold['atomic_summary_resource_preparation'], 'native-on-admission-v1')
+            self.assertTrue(cold['atomic_summary_cold_start'])
+            self.assertFalse(cold['atomic_summary_requires_foreground_warmup'])
+            fixture.engine.summary_state_cold_start = False
             self.assertEqual(body['atomic_summary_protocol'],4)
             self.assertEqual(body['atomic_summary_context'],16384)
             self.assertEqual(body['atomic_summary_isolation'],'shared-weights-state-bank-v1')

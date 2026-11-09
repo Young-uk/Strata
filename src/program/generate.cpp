@@ -32,6 +32,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "history_cache.hpp"
 #include "strata/core/lookup_default.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/core/serve_stop_bound.hpp"
@@ -162,6 +163,7 @@ namespace strata::metal_engine {
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
                 const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
 bool window_summary_supported();
+bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err);
 bool window_continuation_supported();
 uint64_t window_summary_bytes();
 bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err);
@@ -11911,6 +11913,8 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        bool history_approximate = false;
+        uint64_t history_last_hash = 0;
         bool summary_pristine = true; // provenance, not inferred from empty/invalid cache state
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
@@ -12307,7 +12311,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (history_approximate || !conversations.enabled() || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
@@ -14094,6 +14098,7 @@ int main(int argc, char** argv) {
         std::vector<float> summary_img_rows;
         std::vector<const float*> summary_row_ptr;
         bool summary_mrope_identity = true, summary_has_embd_rows = false;
+        bool summary_history_approximate = false;
         // The saved host fields always belong to the INACTIVE bank. Swap them only
         // after Metal has synchronously selected the matching device state.
         auto continuation_select = [&](bool summary, std::string& e) -> bool {
@@ -14109,6 +14114,7 @@ int main(int argc, char** argv) {
             std::swap(nan_flush, summary_bank_nan);
             img_rows.swap(summary_img_rows); row_ptr.swap(summary_row_ptr);
             std::swap(mrope_identity, summary_mrope_identity);
+            std::swap(history_approximate, summary_history_approximate);
             bool had_rows = sp.embd_rows != nullptr;
             sp.embd_rows = summary_has_embd_rows ? row_ptr.data() : nullptr;
             summary_has_embd_rows = had_rows;
@@ -15477,11 +15483,7 @@ int main(int argc, char** argv) {
                 while (options >> word) {
                     const auto eq = word.find('='); if (eq == std::string::npos) break;
                     const std::string key = word.substr(0, eq);
-                    bool known = false;
-                    for (const char* k : {"temperature", "top_p", "top_k", "min_p", "penalty_last_n", "penalty_repeat",
-                         "penalty_freq", "penalty_present", "seed", "pen_from", "logit_bias", "cvec", "logprobs", "allowed",
-                         "ckpt", "pin", "img_keys"}) if (key == k) known = true;
-                    if (!known) { options_ok = false; break; }
+                    if (!strata::core::NativeContinuation::preparation_key_supported(key)) { options_ok = false; break; }
                 }
                 if (!options_ok) { std::printf("ERR APREP unsupported option\n"); continue; }
                 std::string e;
@@ -15495,7 +15497,7 @@ int main(int argc, char** argv) {
             // ANEXT returns only after run/commit have completed on the one GPU.
             if (line == "ASYNC_CAPS") {
 #if defined(STRATA_GPU_METAL)
-                std::printf("ASYNC_CAPS %d 512 128 text\n", continuation_supported() ? 2 : 0);
+                std::printf("ASYNC_CAPS %d 512 2048 text\n", continuation_supported() ? 3 : 0);
 #else
                 std::printf("ASYNC_CAPS %d 512 1 text\n", continuation_supported() ? 1 : 0);
 #endif
@@ -15683,7 +15685,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
                 capable = summary_supported() && strata::metal_engine::window_summary_supported();
 #endif
-                std::printf("SUMMARY_STATE_CAPS %d 16384\n", capable ? 4 : 0);
+                std::printf("SUMMARY_STATE_CAPS %d 16384\n", capable ? 6 : 0);
                 std::fflush(stdout); continue;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
@@ -15841,6 +15843,7 @@ int main(int argc, char** argv) {
                     summary_bank_pristine = summary_pristine; summary_pristine = false;
                     summary_img_rows.swap(img_rows); summary_row_ptr.swap(row_ptr);
                     summary_mrope_identity = mrope_identity; mrope_identity = true;
+                    summary_history_approximate = history_approximate; history_approximate = false;
                     summary_has_embd_rows = sp.embd_rows != nullptr; sp.embd_rows = nullptr;
                     summary_checks.swap(checks); std::swap(summary_conversations, conversations);
                     std::swap(summary_kva_floors, kva_floors);
@@ -16040,6 +16043,7 @@ int main(int argc, char** argv) {
                     summary_img_rows.swap(img_rows);
                     summary_row_ptr.swap(row_ptr);
                     summary_mrope_identity = mrope_identity;
+                    summary_history_approximate = history_approximate; history_approximate = false;
                     summary_has_embd_rows = sp.embd_rows != nullptr;
                     sp.embd_rows = nullptr;
                     summary_checks.swap(checks);
@@ -16078,6 +16082,7 @@ int main(int argc, char** argv) {
                     img_rows.swap(summary_img_rows); summary_img_rows.clear();
                     row_ptr.swap(summary_row_ptr); summary_row_ptr.clear();
                     mrope_identity = summary_mrope_identity;
+                    history_approximate = summary_history_approximate;
                     sp.embd_rows = summary_has_embd_rows ? row_ptr.data() : nullptr;
                     checks.clear(); checks.swap(summary_checks);
                     std::swap(conversations, summary_conversations);
@@ -16208,6 +16213,10 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        if (history_approximate) {
+                            meta.history_positions.reserve(live.size()+1);
+                            for (size_t j = 0; j <= live.size(); ++j) meta.history_positions.push_back(mrope_host[j*3]);
+                        }
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
@@ -16275,6 +16284,13 @@ int main(int argc, char** argv) {
                         refuse(err);
                         continue;
                     }
+#if !defined(STRATA_GPU_METAL)
+                    if (!image.history_positions.empty()) { refuse("approximate history requires Metal"); continue; }
+#endif
+                    if (!strata::history::positions_valid(image.history_positions, image.live.ids.size(), 4*o.max_context) ||
+                        (!image.history_positions.empty() && (!o.vision || use_mtp || use_df2 || o.batch || !stages.empty()))) {
+                        refuse("unsupported approximate history position map"); continue;
+                    }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
@@ -16294,6 +16310,18 @@ int main(int argc, char** argv) {
                                     err.c_str());
                         std::fflush(stdout);
                         return 1;
+                    }
+                    history_approximate = !image.history_positions.empty();
+                    if (history_approximate) {
+                        for (size_t j = 0; j < mrope_host.size()/3; ++j) {
+                            const int64_t p = j < image.live.ids.size() ? image.history_positions[j]
+                                : int64_t(image.history_positions.back()) + int64_t(j-image.live.ids.size());
+                            for (size_t k = 0; k < 3; ++k) mrope_host[j*3+k] = int32_t(p);
+                        }
+                        if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                            std::printf("FATAL restoring history positions failed\n"); std::fflush(stdout); return 1;
+                        }
+                        mrope_identity = false;
                     }
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
@@ -16363,6 +16391,7 @@ int main(int argc, char** argv) {
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             std::string req_draft;   // draft=mtp|dflash2 (--draft auto): which drafter this request uses
             bool req_min_p_set = false;
+            uint64_t req_history = 0;
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
@@ -16385,6 +16414,7 @@ int main(int argc, char** argv) {
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "pen_from") req_pen_from = std::atoll(tok.c_str() + eq + 1);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "history") req_history = std::strtoull(tok.c_str()+eq+1, nullptr, 16);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "prefill") req_prefill_only = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
@@ -16451,6 +16481,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            const int64_t history_output_reserve = prep.id.empty() ? std::max<int64_t>(max_new,1) : int64_t(prep.limit);
             if (!prep.id.empty() && ((uint64_t)n + prep.limit + 8 > (uint64_t)o.max_context || n < 1 ||
                 req_penalty_last_n < 0 || req_penalty_last_n > kPenaltyWindowCap)) {
                 std::printf("ERR APREP full request exceeds context or penalty capacity\n"); continue;
@@ -16495,7 +16526,7 @@ int main(int argc, char** argv) {
             }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
-            if (geni || !mrope_identity) {
+            if (geni || (!mrope_identity && !history_approximate)) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
                 row_ptr.assign((size_t) n, nullptr);
@@ -16696,6 +16727,10 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            if (history_approximate && !geni && n > 0 &&
+                int64_t(mrope_host[size_t(n-1)*3]) + history_output_reserve + 8 >= 4*o.max_context) {
+                live_ok = false; checks.clear(); conversations.clear();
+            }
             nf_hit = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
@@ -16735,6 +16770,44 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+#if defined(STRATA_GPU_METAL)
+            if (req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && !geni && live_ok && !nan_flush && live_imgs.empty() &&
+                stages.empty() && o.batch == 0 && !use_mtp && !use_df2 && o.vision &&
+                want_cvec == cvec_cached && o.prompt_cache > 0 && !starts_with(live, live_imgs)) {
+                const auto plan = strata::history::match(live, ids, int32_t(o.turn_token));
+                if (plan.length) {
+                    const int64_t end = int64_t(plan.source + plan.length);
+                    const int64_t next_pos = history_approximate ? mrope_host[size_t(end) * 3] : end;
+                    const int64_t needed = next_pos + n - int64_t(plan.prefix + plan.length) + history_output_reserve + 8;
+                    if (needed < 4 * o.max_context) {
+                        // Allocate and validate all host metadata before any authoritative device write.
+                        auto compacted = std::vector<int32_t>(ids.begin(), ids.begin() + plan.prefix + plan.length);
+                        auto positions = mrope_host;
+                        for (size_t j = 0; j < plan.length; ++j)
+                            for (size_t k = 0; k < 3; ++k)
+                                positions[(plan.prefix+j)*3+k] = history_approximate
+                                    ? mrope_host[(plan.source+j)*3+k] : int32_t(plan.source+j);
+                        for (size_t j = plan.prefix + plan.length; j < positions.size()/3; ++j)
+                            for (size_t k = 0; k < 3; ++k)
+                                positions[j*3+k] = int32_t(next_pos + int64_t(j-plan.prefix-plan.length));
+                        if (!ver.wait_commit(err) || cudaDeviceSynchronize() != cudaSuccess ||
+                            !strata::metal_engine::window_history_compact(plan.prefix, plan.source, plan.length, err)) {
+                            std::printf("FATAL history cache transition failed: %s\n", err.c_str());
+                            std::fflush(stdout); return 1;
+                        }
+                        live.swap(compacted); mrope_host.swap(positions);
+                        if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                            std::printf("FATAL history position upload failed\n"); std::fflush(stdout); return 1;
+                        }
+                        checks.clear(); conversations.clear(); conversations.take_reuse();
+                        tail_ckpt_len = -1; history_approximate = true; mrope_identity = false;
+                        std::fprintf(stderr, "strata history-cache: approximate=1 prefix=%zu retained=%zu source=%zu\n",
+                                     plan.prefix, plan.length, plan.source);
+                    } else std::fprintf(stderr, "strata history-cache: fallback=position-headroom\n");
+                } else std::fprintf(stderr, "strata history-cache: fallback=no-aligned-retained-run\n");
+            }
+#endif
+            if (!summary_tx.active() && !continuation_summary_selected) history_last_hash = req_history;
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -16918,6 +16991,7 @@ int main(int argc, char** argv) {
                     err.clear();
                 }
             }
+            const bool replaced_history_map = incoming.has_value() || borrow || slot_source >= 0;
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
@@ -17194,6 +17268,17 @@ int main(int argc, char** argv) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
+                }
+            }
+            if (history_approximate && (geni || resume == 0 || replaced_history_map)) {
+                history_approximate = false;
+                if (!geni) {
+                    for (size_t c = 0; c < mrope_host.size()/3; ++c)
+                        for (size_t k = 0; k < 3; ++k) mrope_host[c*3+k] = int32_t(c);
+                    if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        std::printf("FATAL resetting history positions failed\n"); std::fflush(stdout); return 1;
+                    }
+                    mrope_identity = true;
                 }
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring

@@ -190,6 +190,34 @@ int main() {
         check(read == written, "read reports the file size");
         check(same(original, back), "round trip is identical");
     }
+    // Approximate history is explicit format v2; normal v1 golden bytes above stay frozen.
+    {
+        auto approximate = original;
+        approximate.live.imgs.clear();
+        approximate.history_positions.clear();
+        for (size_t j = 0; j <= approximate.live.ids.size(); ++j)
+            approximate.history_positions.push_back(int32_t(j < 4 ? j : j + 100));
+        const auto path = dir / "history-v2.bin";
+        check(session_file_write(path.string(), approximate, id, written, error), "history v2 write");
+        check(uint8_t(slurp(path)[8]) == 2, "history v2 explicit version");
+        SavedConversation back; size_t n = 0;
+        check(session_file_read(path.string(), id, back, n, error), "history v2 read");
+        check(back.history_positions == approximate.history_positions, "absolute positions round trip");
+        for (bool bad_count : {false,true}) {
+            auto d = slurp(path);
+            const size_t at = d.size() - 16 - approximate.history_positions.size()*4;
+            if (bad_count) { uint64_t huge = UINT64_MAX; std::memcpy(d.data()+at-8,&huge,8); }
+            else { int32_t backwards = -1; std::memcpy(d.data()+at,&backwards,4); }
+            const uint64_t h = session_hash64(d.data()+64,d.size()-80,0);
+            std::memcpy(d.data()+d.size()-16,&h,8);
+            const auto corrupt = dir/(bad_count?"history-count.bin":"history-order.bin"); spit(corrupt,d);
+            check(rejects(corrupt,id), "authenticated malformed history metadata refused");
+        }
+        auto invalid = approximate; invalid.history_positions.back() = -1;
+        check(!session_file_write((dir/"bad-history.bin").string(), invalid, id, n, error), "invalid history refused before write");
+        check(!fs::exists(dir/"bad-history.bin"), "invalid history creates no file");
+        error.clear();
+    }
     // writing twice produces the same bytes (deterministic format)
     {
         const fs::path again = dir / "again.bin";
@@ -244,7 +272,7 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 99; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");

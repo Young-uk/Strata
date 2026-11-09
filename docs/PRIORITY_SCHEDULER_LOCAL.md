@@ -1,7 +1,7 @@
-# Experimental weighted summary scheduler
+# Staged weighted summary scheduler
 
-This branch preserves the experimental v7 runtime source used by the personal
-Atomic Chat integration. Publication does not change any running application or service.
+This source is an isolated development copy. It is not installed in Atomic Chat.
+The existing v6 runtime, application, model files and user data remain unchanged.
 
 ## Implemented behavior
 
@@ -41,10 +41,10 @@ and launch-configuration pins remain required and now include the scheduler modu
 and settings. Discovery requires the exact native `ASYNC_CAPS 1 512 1 text` tuple.
 Foreground also requires `APREP_CAPS 1 legacy1`. Public summary protocol is 5 with
 isolation `shared-weights-priority-v1`, `foreground_preparation: legacy-first-token-v1`,
-`foreground_prefill_exclusive: true`, and `continuation_text_only: false`. The companion
+`foreground_prefill_exclusive: true`, and `continuation_text_only: false`. The staged
 app patch validates this exact contract; an old app that understands only protocol
-4 will not enable it. Configuration and qualification receipts are deployment-specific
-and are not included in this branch.
+4 will not enable it. No existing
+configuration or qualification receipt has been rewritten to enable it.
 
 ## Release blockers and explicit limits
 
@@ -66,7 +66,8 @@ progress and prompt-cache reuse are retained.
 Streaming or explicit Metal prompt-window mode is required; native BEGIN still
 checks actual shared scratch/arena warmup and memory. Capability is not readiness.
 
-These limitations must accompany any experimental packaging decision. No
+These limitations must accompany any experimental packaging decision. No installed
+app, runtime configuration, qualification pin or user data has been changed. No
 claim of full Dstar parity or empirical safety follows from these checks.
 
 ## Validation
@@ -75,20 +76,11 @@ The Metal release target compiles and links on the connected Mac, using two comp
 jobs. Focused CPU/fake-protocol checks cover weighted selection, request isolation,
 cancellation, disconnect drain, stale identity, process replacement, changed main
 token counts, pre-BEGIN cancellation, uncertain transition poisoning and control
-rejection. Existing snapshot/state-bank/qualification checks are also run. The earlier combined
-Python CPU/fake-protocol suite recorded 141 passing tests. The companion app recorded 167 mocked
+rejection. Existing snapshot/state-bank/qualification checks are also run. The latest combined
+Python CPU/fake-protocol suite passes 141 tests. The staged app passes 167 mocked
 checks, its TypeScript check and scoped ESLint. A concurrent fake-engine check
 observes summary output before foreground completion without a priority STOP.
 
-The checks described here did not load or query a model. No real conversation, long-context, image,
+No model was loaded or queried, and no real conversation, long-context, image,
 performance, GPU state-parity or stress test was performed. Such behavior remains
 unverified and the user retains responsibility for requested real-model testing.
-
-## Branch preservation verification
-
-The v7 source was preserved from the local integration against upstream v0.2.12
-(commit `146df3c468739147f520ac3816de806f71232571`). A fresh CPU/fake-only run of
-`serve.test_priority_scheduler`, `serve.test_priority_client`,
-`serve.test_atomic_summary`, `serve.test_summary_state_bank`, and
-`serve.test_summary_qualification_binding` passed 116 tests. These focused checks
-are not a full regression or real-model qualification.

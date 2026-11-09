@@ -1,9 +1,5 @@
 # Experimental isolated summary transactions
 
-This document describes the legacy protocol 3 serial transaction path.
-The v7 priority integration uses the separate protocol 5 contract documented in
-[PRIORITY_SCHEDULER_LOCAL.md](PRIORITY_SCHEDULER_LOCAL.md).
-
 This feature is opt-in and must remain unqualified until tested on the exact model,
 backend, binary, runtime settings and maximum main-session/cache sizes in use.
 It serializes summary work through the same engine and device session. It is not

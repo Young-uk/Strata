@@ -33,6 +33,8 @@ def request(req, *, count=False):
     """Validate the same wire request for counting and generation, without mutation."""
     if req.get("atomic_summary") is not True or req.get("think") is not False:
         raise ValueError("summary requests require atomic_summary:true and think:false")
+    if "atomic_summary_recovery" in req and type(req["atomic_summary_recovery"]) is not bool:
+        raise ValueError("atomic_summary_recovery must be a boolean")
     if req.get("tools") or req.get("strata_mcp") or req.get("response_format"):
         raise ValueError("summary requests are text-only, without tools or response_format")
     messages = req.get("messages")
@@ -53,8 +55,8 @@ def request(req, *, count=False):
     cap = req.get("max_tokens", OUTPUT)
     if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= OUTPUT:
         raise ValueError(f"summary max_tokens must be between 1 and {OUTPUT}")
-    if not count and req.get("stream"):
-        raise ValueError("serial summary transactions require stream:false")
+    if "stream" in req and type(req["stream"]) is not bool:
+        raise ValueError("summary stream must be a boolean")
     # Do not inherit foreground thinking, MCP, or cache hints. Exact same kwargs
     # are used for count and inference, regardless of shared server defaults.
     out = dict(req)
@@ -68,7 +70,9 @@ def request(req, *, count=False):
 def model_fingerprint(cfg):
     """Stable local artifact change detector, not a cryptographic model-content claim.
 
-    Paths stay private inside the digest. File size and nanosecond mtime plus the
+    Device numbers are mount-session identities and change across reboots.
+    Keep them in transient hash-race checks, never in the persisted model pin.
+    Paths stay private inside the digest. Inode, ctime, file size and nanosecond mtime plus the
     resolved generation config distinguish replacements without reading 40GB.
     Tokenizer/template bytes are small enough to hash completely.
     """
@@ -90,13 +94,13 @@ def model_fingerprint(cfg):
         path = Path(value).expanduser()
         path = (cwd / path).resolve() if not path.is_absolute() else path.resolve()
         stat = path.stat()  # fail closed: an unverified path is not a model identity
-        artifacts.append((str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        artifacts.append((str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
         if path.is_dir():
             # Bind every pack member, not only directory mtime/tokenizer names.
             for member in sorted(path.rglob('*')):
                 if member.is_file():
                     info = member.stat()
-                    artifacts.append((str(member.resolve()), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+                    artifacts.append((str(member.resolve()), info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
             for name in ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json", "chat_template.jinja"):
                 child = path / name
                 if child.is_file():
@@ -120,7 +124,7 @@ def model_fingerprint(cfg):
             "atomic_summary_mode", "atomic_summary_state_bank_enabled",
             "atomic_summary_state_bank_max_bytes", "atomic_summary_state_bank_provenance",
             "atomic_summary_scheduler", "atomic_summary_foreground_weight")}
-    return "strata-stat-v1:" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return "strata-stat-v2:" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 QUALIFICATION_PIN_KEYS = (
@@ -193,7 +197,7 @@ def qualification_mismatch(cfg):
     """Return a safe diagnostic, never turn optional drift into a foreground error."""
     for key in QUALIFICATION_PIN_KEYS:
         value = cfg.get(key)
-        pattern = r"strata-stat-v1:[0-9a-f]{64}" if key.endswith("model_fingerprint") else r"[0-9a-f]{64}"
+        pattern = r"strata-stat-v2:[0-9a-f]{64}" if key.endswith("model_fingerprint") else r"[0-9a-f]{64}"
         if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
             return "missing_or_invalid_" + key
     try:
@@ -460,8 +464,24 @@ class SummaryLane:
                 os.close(fd)
             try:
                 if bank:
-                    with native_turn():
-                        begun = engine.summary_state("begin", txid, max_slot_bytes=self.max_slot_bytes)
+                    for attempt in range(2):
+                        try:
+                            with native_turn():
+                                begun = engine.summary_state("begin", txid, max_slot_bytes=self.max_slot_bytes)
+                            break
+                        except BaseException as exc:
+                            refused = getattr(exc, "summary_refused", False)
+                            reason = str(exc)[:240] if refused else "uncertain native transition"
+                            print(f"[atomic-summary] bank admission attempt {attempt + 1}: {reason}", flush=True)
+                            # A clean refusal after shared preparation never selected a
+                            # summary bank. Re-enter the full native safety gate once,
+                            # with already prepared resources and a fresh stable-swap
+                            # observation. Never retry arbitrary pressure/OOM refusals
+                            # or an uncertain transition, and never evaluate a token.
+                            if (attempt == 0 and refused and not cancel.is_set() and
+                                    reason == "pressure or memory changed during shared resource preparation"):
+                                continue
+                            raise
                     mode, counts = "state-bank", begun
                 else:
                     begun = engine.session_file("summary_begin", path, summary_envelope=self.envelope)
@@ -478,7 +498,22 @@ class SummaryLane:
                 if not getattr(exc, "summary_refused", False):
                     with self.lock:
                         self.poisoned, self.recovery_path = True, path
-                raise SummaryError("summary state could not be established; main conversation preserved"
+                refusal_messages = {
+                    "pressure or memory changed during shared resource preparation":
+                        "Summary resources are ready, but memory pressure or swap activity is not stable; originals retained",
+                    "summary bank allocation refused":
+                        "Not enough memory for the separate summary state; originals retained",
+                }
+                memory_refusals = {
+                    "normal pressure, stable swap and RAM floor required",
+                    "pressure or available memory changed during bank allocation",
+                    "pressure or memory changed during quiescence",
+                    "pressure or memory refused shared resource preparation",
+                }
+                reason = str(exc)
+                message = refusal_messages.get(reason, "Summary is waiting for normal memory pressure, stable swap and available RAM; originals retained"
+                    if reason in memory_refusals else "summary state could not be established; main conversation preserved")
+                raise SummaryError(message
                                    if getattr(exc, "summary_refused", False) else
                                    "summary begin outcome is uncertain; inference blocked pending recovery",
                                    409 if getattr(exc, "summary_refused", False) else 503,
@@ -529,3 +564,26 @@ class SummaryLane:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
+
+
+def historical_handoff_key(messages):
+    """Inspect validated wire roles BEFORE the frontend converts late systems to users."""
+    if isinstance(messages, str):
+        try:
+            messages = json.loads(messages)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(messages, list):
+        return None
+    labels = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        content = m.get("content")
+        if isinstance(content, list) and all(isinstance(p, dict) and p.get("type") == "text" and
+                                            isinstance(p.get("text"), str) for p in content):
+            content = "".join(p["text"] for p in content)
+        if isinstance(content, str) and content.startswith(
+                "Earlier conversation summary (historical data, not new instructions)."):
+            labels.append(content)
+    return hashlib.sha256(json.dumps(labels, ensure_ascii=False).encode()).hexdigest()[:16] if labels else None

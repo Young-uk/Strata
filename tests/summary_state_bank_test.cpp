@@ -24,6 +24,25 @@ int main() {
     check(!SummaryStateBank::warmup_ready(false, true, true, false, true, 2047, 2048));
     check(SummaryStateBank::warmup_ready(false, false, true, false, false, 2048, 2048));
     check(SummaryStateBank::warmup_ready(false, false, true, true, false, 0, 2048));
+    // Cold resource preparation is bounded by admission before and after it.
+    bool ready = false; int prepared = 0, admissions = 0; std::string err;
+    auto is_ready = [&]() { return ready; };
+    auto admit = [&]() { ++admissions; return true; };
+    auto prepare = [&]() { ++prepared; ready = true; return true; };
+    check(SummaryStateBank::prepare_resources(is_ready, admit, prepare, err));
+    check(ready && prepared == 1 && admissions == 2);
+    check(SummaryStateBank::prepare_resources(is_ready, admit, prepare, err));
+    check(prepared == 1 && admissions == 2); // Warm admission never rebuilds shared scratch.
+    ready = false;
+    check(!SummaryStateBank::prepare_resources(is_ready, [] { return false; }, prepare, err));
+    check(prepared == 1 && !ready);
+    admissions = 0;
+    check(!SummaryStateBank::prepare_resources(is_ready, [&] { return ++admissions == 1; }, prepare, err));
+    check(ready && admissions == 2); // Ready resources alone never override a pressure refusal.
+    ready = false;
+    check(!SummaryStateBank::prepare_resources(is_ready, admit, [] { return false; }, err));
+    check(!ready);
+    check(!SummaryStateBank::prepare_resources(is_ready, admit, [] { return true; }, err));
     SummaryStateBank tx;
     check(!tx.active()); check(tx.allows("SAVE original"));
     tx.id = "Job1"; tx.epoch = 1; tx.main_tokens = 65536; tx.allocated_bytes = 400000000;

@@ -30,6 +30,7 @@ class Owner:
     admitted: bool = False
     closed: bool = False
     turns: int = 0
+    recovery: bool = False
 
 
 class WeightedScheduler:
@@ -61,8 +62,8 @@ class WeightedScheduler:
         if self.poison_reason:
             raise PriorityError("native continuation ownership is uncertain; restart required")
 
-    def admit(self, summary, cancel, deadline=None):
-        owner = Owner(bool(summary), cancel)
+    def admit(self, summary, cancel, deadline=None, *, recovery=False):
+        owner = Owner(bool(summary), cancel, recovery=bool(summary and recovery))
         with self.cv:
             self._check()
             self.waiters[owner.summary].append(owner)
@@ -92,6 +93,8 @@ class WeightedScheduler:
         fg, bg = self.owners[False], self.owners[True]
         fg = fg if fg and fg.ready and not fg.closed else None
         bg = bg if bg and bg.ready and not bg.closed else None
+        if bg and bg.recovery:
+            return bg
         if fg and bg:
             return bg if self.foreground_turns >= self.weight else fg
         return fg or bg
@@ -184,6 +187,8 @@ class WeightedScheduler:
             self._check()
             if not owner.summary or self.turn_owner is not owner:
                 raise PriorityError("summary input sizing requires the current compute permit")
+            if owner.recovery:
+                return 2048
             foreground = self.owners[False]
             waiting = any(not item.cancel.is_set() for item in self.waiters[False])
             return 1 if (foreground is not None and not foreground.closed) or waiting else 128
@@ -204,6 +209,7 @@ class WeightedScheduler:
             return {
                 "policy": "weighted-quanta-v1", "foreground_weight": self.weight,
                 "summary_weight": 1, "compute_serialized": True,
+                "recovery_priority": bool(self.owners[True] and self.owners[True].recovery),
                 "active_lane": ("summary" if self.turn_owner.summary else "foreground") if self.turn_owner else None,
                 "foreground_turns": self.owners[False].turns if self.owners[False] else 0,
                 "summary_turns": self.owners[True].turns if self.owners[True] else 0,

@@ -4,6 +4,8 @@
 int main() {
     using strata::core::NativeContinuation;
     NativeContinuation c; std::string e;
+    assert(NativeContinuation::preparation_key_supported("history"));
+    assert(!NativeContinuation::preparation_key_supported("unknown"));
     assert(NativeContinuation::preparation_cursor(20, 8, 3, true) == 8);
     assert(NativeContinuation::preparation_cursor(20, 8, 3, false) == 3);
     assert(NativeContinuation::preparation_cursor(20, 1000, 1000, true) == 20);
@@ -26,13 +28,14 @@ int main() {
         NativeContinuation idle; idle.summary = true; idle.origin = 1001;
         assert(idle.quantum_inputs(128) == 128);
         assert(idle.quantum_inputs(1) == 1);
-        assert(idle.quantum_inputs(999) == 128);
+        assert(idle.quantum_inputs(999) == 999);
+        assert(idle.quantum_inputs(2048) == 1000);
         idle.cursor = 990; assert(idle.quantum_inputs(128) == 10);
         idle.cursor = 1000; assert(idle.quantum_inputs(128) == 1); // decode never batches
         std::string id; size_t inputs = 0;
         assert(NativeContinuation::parse_step("ABC123", id, inputs) && inputs == 1);
         assert(NativeContinuation::parse_step("ABC123 128", id, inputs) && inputs == 128);
-        for (const char* bad : {"", "a-b 128", "A 0", "A 129", "A -1", "A nan", "A 1 2"})
+        for (const char* bad : {"", "a-b 128", "A 0", "A 2049", "A -1", "A nan", "A 1 2"})
             assert(!NativeContinuation::parse_step(bad, id, inputs));
     }
     c.cursor = 2; assert(c.prompt_remaining() == 0);

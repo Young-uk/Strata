@@ -11,6 +11,12 @@ namespace strata::core {
 // A cursor is a count of COMMITTED inputs. ids[cursor] is the pending input,
 // including the last emitted token. A yield never destroys this record.
 struct NativeContinuation {
+    static bool preparation_key_supported(const std::string& key) {
+        for (const char* k : {"temperature", "top_p", "top_k", "min_p", "penalty_last_n", "penalty_repeat",
+            "penalty_freq", "penalty_present", "seed", "pen_from", "logit_bias", "cvec", "logprobs", "allowed",
+            "ckpt", "pin", "img_keys", "history"}) if (key == k) return true;
+        return false;
+    }
     std::string id;
     bool summary = false, done = false;
     size_t origin = 0, cursor = 0, produced = 0, limit = 0;
@@ -30,7 +36,7 @@ struct NativeContinuation {
     bool active() const { return !id.empty() && !done; }
     size_t prompt_remaining() const { return cursor < origin - 1 ? origin - 1 - cursor : 0; }
     size_t quantum_inputs(size_t summary_inputs = 1) const {
-        const size_t bound = summary ? std::clamp<size_t>(summary_inputs, 1, 128) : 512;
+        const size_t bound = summary ? std::clamp<size_t>(summary_inputs, 1, 2048) : 512;
         return prompt_remaining() ? std::min<size_t>(bound, prompt_remaining()) : 1;
     }
     // Protocol 2: an optional bounded input budget for this quantum only.
@@ -43,7 +49,7 @@ struct NativeContinuation {
         if (!(in >> value)) return true;
         uint64_t n = 0;
         auto parsed = std::from_chars(value.data(), value.data() + value.size(), n);
-        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !n || n > 128 || (in >> extra)) return false;
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !n || n > 2048 || (in >> extra)) return false;
         inputs = (size_t)n;
         return true;
     }

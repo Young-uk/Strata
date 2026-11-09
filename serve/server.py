@@ -1655,7 +1655,8 @@ class StrataEngine:
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
-        keys = ""
+        history = sampling.get("_atomic_history_reuse")
+        keys = f" history={history}" if isinstance(history, str) and re.fullmatch(r"[0-9a-f]{16}", history) else ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -3028,8 +3029,9 @@ class StrataEngine:
                     continue
                 fields = line.split()
                 if action == "caps":
-                    if fields != ["SUMMARY_STATE_CAPS", "4", "16384"]:
-                        raise ValueError("engine lacks state-bank protocol4")
+                    if fields not in (["SUMMARY_STATE_CAPS", "4", "16384"], ["SUMMARY_STATE_CAPS", "6", "16384"]):
+                        raise ValueError("engine lacks state-bank protocol4/6")
+                    self.summary_state_cold_start = fields[1] == "6"
                     return True
                 if fields[:1] == ["SUMMARY_STATE_REFUSED"] and action == "begin" and len(fields) >= 3 and fields[1] == txid:
                     refusal = SessionRefused("refused", " ".join(fields[2:]), False)
@@ -6386,7 +6388,8 @@ class Service:
                     yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
                 else:
                     deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
-                    admission = scheduler.admit(sampling.get("atomic_summary") is True, cancel, deadline)
+                    admission = scheduler.admit(sampling.get("atomic_summary") is True, cancel, deadline,
+                                                recovery=sampling.get("atomic_summary_recovery") is True)
                     waiting_id = uuid.uuid4().hex[:12]
                     admitted = False
                     cancel._priority_queued_at = time.time()
@@ -7377,13 +7380,23 @@ class LogprobEntries:
             e["logprob"] = own["logprob"]           # (it used to copy the first alternative's, another token's)
         return e
 
-def prompt_progress(svc: Service):
+def prompt_progress(svc: Service, cancel=None):
     """The last PP line as llama.cpp's `prompt_progress`, so a client written for llama.cpp reads both servers: the
     same four fields, `time_ms` elapsed since prompt reading started, and `processed` counting from token 0 so that a
     client takes the reused prefix out with `cache` (llama.cpp's rule: the timed progress is
     `(processed-cache)/(total-cache)`).  None when there is nothing to say: no PP yet, or the line that says the prompt
     is read.  An engine too old to print RESUME gives `cache` 0, which only makes a reused prefix count as work."""
     engine = svc.engine
+    # Weighted lanes share the engine object. A stream may only observe its
+    # own acknowledged counters, never the other lane's most recent PP line.
+    if getattr(getattr(svc, "summary_lane", None), "scheduler", None) is not None and cancel is not None:
+        owned = getattr(cancel, "_atomic_input_progress", None)
+        if owned is None:
+            return None
+        read, total, cache, ms = owned
+        if total <= 0 or read < cache or read > total:
+            return None
+        return {"total": total, "cache": cache, "processed": read, "time_ms": ms}
     if getattr(engine, "batch", 0):      # --batch: the engine's progress is one global line, not this request's
         return None
     progress = getattr(engine, "progress", None)
@@ -7427,7 +7440,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
-            pp = prompt_progress(svc) if want_progress else None
+            pp = prompt_progress(svc, cancel) if want_progress else None
             yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
             c = chunk({})
@@ -8412,7 +8425,11 @@ def make_handler(svc: Service):
                                      "atomic_summary_foreground_preparation": "legacy-first-token-v1" if svc.summary_lane.scheduler else None,
                                      "atomic_summary_foreground_prefill_exclusive": True if svc.summary_lane.scheduler else None,
                                      "atomic_summary_cold_start": (svc.summary_lane.enabled
-                                         and not svc.summary_lane.poisoned and svc.summary_lane.mode != "state-bank-v1"),
+                                         and not svc.summary_lane.poisoned and (svc.summary_lane.mode != "state-bank-v1"
+                                             or getattr(svc.engine, "summary_state_cold_start", False))),
+                                     "atomic_summary_resource_preparation": ("native-on-admission-v1"
+                                         if getattr(svc.engine, "summary_state_cold_start", False) else None),
+                                     "atomic_summary_stream_progress": True,
                                      "atomic_summary_token_count": True,
                                      "atomic_summary_qualified_envelope": (dict(svc.summary_lane.envelope)
                                          if svc.summary_lane.enabled and not svc.summary_lane.poisoned and svc.summary_lane.envelope else None),
@@ -8421,7 +8438,8 @@ def make_handler(svc: Service):
                                      "atomic_summary_serialized_compute": svc.summary_lane.mode == "state-bank-v1",
                                      "atomic_summary_experimental": svc.summary_lane.mode == "state-bank-v1",
                                      "atomic_summary_state_bank_provenance": "experimental-user-validation" if svc.summary_lane.mode == "state-bank-v1" else None,
-                                     "atomic_summary_requires_foreground_warmup": svc.summary_lane.mode == "state-bank-v1",
+                                     "atomic_summary_requires_foreground_warmup": (svc.summary_lane.mode == "state-bank-v1"
+                                         and not getattr(svc.engine, "summary_state_cold_start", False)),
                                      "atomic_summary_scratch_reserve_bytes": atomic_summary.SCRATCH_RESERVE_BYTES,
                                      "atomic_summary_isolation": (("shared-weights-priority-v1" if svc.summary_lane.scheduler else "shared-weights-state-bank-v1" if svc.summary_lane.mode == "state-bank-v1" else "serial-snapshot-v1") if svc.summary_lane.enabled else None),
                                      "atomic_tool_preamble": 0,
@@ -8923,6 +8941,9 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
+            if "atomic_summary_recovery" in req and (type(req["atomic_summary_recovery"]) is not bool or
+                    (req["atomic_summary_recovery"] and req.get("atomic_summary") is not True)):
+                raise ValueError("atomic_summary_recovery requires a boolean on a summary request")
             if "atomic_summary" in req and not isinstance(req["atomic_summary"], bool):
                 raise ValueError("atomic_summary must be a boolean")
             if req.get("atomic_summary") is True:
@@ -8933,6 +8954,8 @@ def make_handler(svc: Service):
                 req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
+            req["_atomic_history_reuse"] = (atomic_summary.historical_handoff_key(req.get("messages"))
+                if req.get("atomic_summary") is not True and svc.summary_lane.enabled else None)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered

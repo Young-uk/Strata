@@ -13,6 +13,17 @@ struct SummaryStateBank {
         return streaming ? arena_ready && (prompt_windows || !gemm_enabled || gemm_ready)
                          : prompt_windows || prompt_capacity >= chunk;
     }
+    // Prepare shared resources without a dummy foreground inference. Publication
+    // remains the caller's job, after this gate and all bank allocations succeed.
+    template<class Ready, class Admit, class Prepare>
+    static bool prepare_resources(Ready ready, Admit admit, Prepare prepare, std::string& err) {
+        if (ready()) return true;
+        if (!admit()) { err = "pressure or memory refused shared resource preparation"; return false; }
+        if (!prepare()) return false;
+        if (!admit()) { err = "pressure or memory changed during shared resource preparation"; return false; }
+        if (!ready()) { err = "shared summary resources are not ready after preparation"; return false; }
+        return true;
+    }
     bool active() const noexcept { return !id.empty(); }
     static bool valid_id(const std::string& s) noexcept {
         if (s.empty() || s.size() > 64) return false;
