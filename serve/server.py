@@ -10747,7 +10747,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             observed = atomic_summary.runtime_qualification_config(cfg, svc.engine)
             identity = atomic_summary.qualified_runtime_pins(observed)
             disk_session = DiskSession(cfg["atomic_disk_session_dir"], identity,
-                previous_backend_sha256=cfg.get("atomic_disk_session_previous_backend_sha256"))
+                previous_backend_sha256=cfg.get("atomic_disk_session_previous_backend_sha256"),
+                reviewed_upgrades=cfg.get("atomic_disk_session_reviewed_upgrades"))
             try:
                 if disk_session.restore(svc.engine) is None:
                     print("[strata] disk session: no compatible saved session (cold start)", flush=True)

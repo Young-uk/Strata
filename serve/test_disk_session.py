@@ -152,3 +152,60 @@ class ThreadOwnershipTests(unittest.TestCase):
         self.assertIsNone(self.cache.save(self.service()))
         self.assertFalse(self.cache.manifest.exists())
         self.assertFalse(list(self.cache.directory.glob('*.session*')))
+
+
+class ReviewedUpgradeTests(unittest.TestCase):
+    setUp = DiskTests.setUp
+    service = DiskTests.service
+    def pins(self):
+        old = {'atomic_summary_expected_native_sha256': 'a'*64,
+               'atomic_summary_expected_model_fingerprint': 'strata-stat-v2:'+'b'*64,
+               'atomic_summary_expected_backend_sha256': 'c'*64}
+        new = {'atomic_summary_expected_native_sha256': 'd'*64,
+               'atomic_summary_expected_model_fingerprint': 'strata-stat-v2:'+'e'*64,
+               'atomic_summary_expected_backend_sha256': 'f'*64}
+        bridge = {'current_native': new['atomic_summary_expected_native_sha256'],
+                  'current_model': new['atomic_summary_expected_model_fingerprint'], 'previous': old}
+        return old, new, bridge
+
+    def test_exact_reviewed_upgrade_restores_without_rewriting_manifest(self):
+        old, new, bridge = self.pins()
+        DiskSession(self.temp.name, old).save(self.service())
+        manifest = self.cache.manifest.read_bytes()
+        self.assertIsNone(DiskSession(self.temp.name, new).restore(self.engine))
+        self.assertEqual(DiskSession(self.temp.name, new, reviewed_upgrades=[bridge]).restore(self.engine)['tokens'], 123)
+        self.assertEqual(self.cache.manifest.read_bytes(), manifest)
+
+    def test_other_destination_native_model_and_context_are_not_admitted(self):
+        old, new, bridge = self.pins()
+        DiskSession(self.temp.name, old).save(self.service())
+        for field in ('atomic_summary_expected_native_sha256', 'atomic_summary_expected_model_fingerprint'):
+            candidate = {**new, field: 'different-context-or-model'}
+            before = len(self.engine.calls)
+            self.assertIsNone(DiskSession(self.temp.name, candidate, reviewed_upgrades=[bridge]).restore(self.engine))
+            self.assertEqual(len(self.engine.calls), before)
+
+    def test_other_previous_identity_is_not_admitted(self):
+        old, new, bridge = self.pins()
+        changed = {**old, 'atomic_summary_expected_backend_sha256': '1'*64}
+        DiskSession(self.temp.name, changed).save(self.service())
+        before = len(self.engine.calls)
+        self.assertIsNone(DiskSession(self.temp.name, new, reviewed_upgrades=[bridge]).restore(self.engine))
+        self.assertEqual(len(self.engine.calls), before)
+
+    def test_native_reader_still_refuses_invalid_state(self):
+        old, new, bridge = self.pins()
+        DiskSession(self.temp.name, old).save(self.service())
+        original = self.cache.manifest.read_bytes()
+        self.engine.fail = True
+        with self.assertRaises(RuntimeError):
+            DiskSession(self.temp.name, new, reviewed_upgrades=[bridge]).restore(self.engine)
+        self.assertEqual(self.cache.manifest.read_bytes(), original)
+        self.assertIsNone(self.engine.atomic_main_snapshot)
+
+    def test_invalid_destination_and_incomplete_previous_pins_are_rejected(self):
+        old, new, bridge = self.pins()
+        for bad in ({**bridge, 'current_native': None}, {**bridge, 'previous': {}},
+                    {**bridge, 'previous': {**old, 'extra': 'not accepted'}}):
+            with self.assertRaises(ValueError):
+                DiskSession(self.temp.name, new, reviewed_upgrades=[bad])

@@ -14,7 +14,7 @@ import uuid
 
 
 class DiskSession:
-    def __init__(self, directory, identity, max_bytes=4 * 1024**3, previous_backend_sha256=None):
+    def __init__(self, directory, identity, max_bytes=4 * 1024**3, previous_backend_sha256=None, reviewed_upgrades=None):
         self.directory = Path(directory)
         if not self.directory.is_absolute() or self.directory.is_symlink():
             raise ValueError('disk session directory must be an absolute non-symlink path')
@@ -22,12 +22,34 @@ class DiskSession:
         self.identity = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         self.compatible_identities = {self.identity}
         # A reviewed backend-only update may retain the same native session
-        # format. Never relax the native binary or model identity checks.
+        # format. This backend-only route never relaxes native or model checks.
         if previous_backend_sha256 is not None:
             if not re.fullmatch(r'[a-f0-9]{64}', previous_backend_sha256):
                 raise ValueError('invalid previous disk-session backend identity')
             previous = {**identity, 'atomic_summary_expected_backend_sha256': previous_backend_sha256}
             self.compatible_identities.add(hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest())
+        # Native file readers still validate model/config fingerprints and
+        # tensor geometry. Only an explicitly reviewed source/destination pair
+        # may bridge the outer executable qualification identity.
+        for upgrade in reviewed_upgrades or []:
+            if not isinstance(upgrade, dict) or set(upgrade) != {'current_native', 'current_model', 'previous'}:
+                raise ValueError('invalid reviewed disk-session upgrade')
+            if (not re.fullmatch(r'[a-f0-9]{64}', str(upgrade['current_native'])) or
+                    not re.fullmatch(r'strata-stat-v2:[a-f0-9]{64}', str(upgrade['current_model']))):
+                raise ValueError('invalid reviewed destination pins')
+            previous = upgrade['previous']
+            keys = {'atomic_summary_expected_native_sha256', 'atomic_summary_expected_model_fingerprint',
+                    'atomic_summary_expected_backend_sha256'}
+            if not isinstance(previous, dict) or set(previous) != keys:
+                raise ValueError('invalid previous disk-session pins')
+            if not all(isinstance(previous[key], str) and re.fullmatch(r'[a-f0-9]{64}', previous[key])
+                       for key in ('atomic_summary_expected_native_sha256', 'atomic_summary_expected_backend_sha256')):
+                raise ValueError('invalid previous disk-session checksums')
+            if not re.fullmatch(r'strata-stat-v2:[a-f0-9]{64}', str(previous['atomic_summary_expected_model_fingerprint'])):
+                raise ValueError('invalid previous disk-session model')
+            if (identity.get('atomic_summary_expected_native_sha256') == upgrade['current_native'] and
+                    identity.get('atomic_summary_expected_model_fingerprint') == upgrade['current_model']):
+                self.compatible_identities.add(hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest())
         self.max_bytes = max_bytes
         self.manifest = self.directory / 'latest.json'
 
@@ -46,6 +68,7 @@ class DiskSession:
             raise ValueError('session manifest is a symlink')
         record = json.loads(self.manifest.read_text())
         if require_identity and record.get('identity') not in self.compatible_identities:
+            print('[strata] disk session not restored: qualification identity mismatch', flush=True)
             return None
         name = record.get('file', '')
         if not re.fullmatch(r'[a-f0-9]{32}\.session', name):
@@ -100,6 +123,8 @@ class DiskSession:
             from serve.history_plan import restored_ids
             ids = restored_ids(self.directory / record['file'], binding)
             engine.atomic_main_snapshot = {**binding, 'restored': True, **({'ids': ids} if ids is not None else {})}
+        if record.get('identity') != self.identity:
+            print('[strata] disk session accepted through reviewed update compatibility', flush=True)
         print(f"[strata] disk session restored: {result['tokens']} tokens", flush=True)
         return result
 
