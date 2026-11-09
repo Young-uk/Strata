@@ -224,8 +224,10 @@ class ContinuationClient:
         totals = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": None,
                   "decode_ms": None, "reused": 0, "prompt_read": 0, "finish": "cancel"}
         clone = getattr(cancel, "_atomic_clone_snapshot", None) if owner.summary else None
-        # Record only a finished text request. Interrupted or image work must
+        # Previously only finished text requests were recorded. Interrupted work must
         # invalidate the former owner before it can be mistaken for this cache.
+        # Completed GENI tokens and positions are copied by the native fork;
+        # the summary never needs to reopen the embeddings file.
         emitted = []
         cache_owner = sampling.get("atomic_cache_owner") if not owner.summary else None
         if not owner.summary:
@@ -454,7 +456,7 @@ class ContinuationClient:
             if completed and totals.get("finish") in ("stop", "length"):
                 totals["prompt_read"] = len(ids) - totals["reused"]
             self.engine.last = totals
-            if not owner.summary and not embeddings and completed and totals.get("finish") == "stop" and emitted and cache_owner and not cancel.is_set():
+            if not owner.summary and completed and totals.get("finish") == "stop" and emitted and cache_owner and not cancel.is_set():
                 committed_ids = [*ids, *emitted[:-1]]
                 h = 14695981039346656037
                 for token in committed_ids:

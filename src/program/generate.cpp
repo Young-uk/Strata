@@ -15850,7 +15850,7 @@ int main(int argc, char** argv) {
                         !strata::metal_engine::window_summary_supported() || summary_bank.epoch == UINT64_MAX) {
                         refuse_state("state bank unavailable for this configuration or session"); continue;
                     }
-                    if (state_fork && (!live_ok || live.empty() || !live_imgs.empty() ||
+                    if (state_fork && (!live_ok || live.empty() ||
                         continuations[0].active() || fork_tokens != live.size() ||
                         fork_hash != strata::core::SummaryStateBank::token_hash(live))) {
                         refuse_state("foreground cache changed before clone admission"); continue;
@@ -15896,7 +15896,7 @@ int main(int argc, char** argv) {
                     summary_bank_cloned = state_fork;
                     summary_bank.context = state_fork ? strata::metal_engine::window_summary_capacity() : 16384;
                     summary_clone_next_position = state_fork
-                        ? (history_approximate ? uint64_t(mrope_host[live.size()*3]) : live.size()) : 0;
+                        ? ((history_approximate || !mrope_identity) ? uint64_t(mrope_host[live.size()*3]) : live.size()) : 0;
                     if (state_fork && summary_clone_positions) strata::kernels::mrope_table_set(summary_clone_positions);
                     summary_bank_live.swap(live); summary_bank_imgs.swap(live_imgs);
                     summary_bank_live_ok = live_ok; live_ok = state_fork;
@@ -15904,7 +15904,10 @@ int main(int argc, char** argv) {
                     summary_bank_pristine = summary_pristine; summary_pristine = false;
                     summary_img_rows.swap(img_rows); summary_row_ptr.swap(row_ptr);
                     summary_mrope_identity = mrope_identity; mrope_identity = state_fork ? summary_mrope_identity : true;
-                    summary_history_approximate = history_approximate; history_approximate = state_fork && summary_history_approximate;
+                    summary_history_approximate = history_approximate;
+                    // A processed image clone has non-identity positions but no
+                    // raw image owners. Preserve that map for text-only AFORK.
+                    history_approximate = state_fork && (summary_history_approximate || !summary_mrope_identity);
                     summary_has_embd_rows = sp.embd_rows != nullptr; sp.embd_rows = nullptr;
                     summary_checks.swap(checks); std::swap(summary_conversations, conversations);
                     std::swap(summary_kva_floors, kva_floors);
@@ -16589,6 +16592,12 @@ int main(int argc, char** argv) {
             }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            // A text handoff may remove all old image turns. Keep the original
+            // position map until that transition is proven; normal fallback
+            // below may still reset the active text map and reread the prompt.
+            std::vector<int32_t> history_image_positions;
+            if (req_history && req_history != history_last_hash && !geni && live_ok && !live_imgs.empty())
+                history_image_positions = mrope_host;
             if (geni || (!mrope_identity && !history_approximate)) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -16834,22 +16843,24 @@ int main(int argc, char** argv) {
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
 #if defined(STRATA_GPU_METAL)
-            if (req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && !geni && live_ok && !nan_flush && live_imgs.empty() &&
+            if (req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && !geni && live_ok && !nan_flush &&
                 stages.empty() && o.batch == 0 && !use_mtp && !use_df2 && o.vision &&
                 want_cvec == cvec_cached && o.prompt_cache > 0 && !starts_with(live, live_imgs)) {
                 const auto plan = strata::history::match(live, ids, int32_t(o.turn_token));
-                if (plan.length) {
+                if (plan.length && strata::history::images_discarded(live, live_imgs, plan, kImagePad)) {
                     const int64_t end = int64_t(plan.source + plan.length);
-                    const int64_t next_pos = history_approximate ? mrope_host[size_t(end) * 3] : end;
+                    const auto& original_positions = history_image_positions.empty() ? mrope_host : history_image_positions;
+                    const bool mapped = history_approximate || !history_image_positions.empty();
+                    const int64_t next_pos = mapped ? original_positions[size_t(end) * 3] : end;
                     const int64_t needed = next_pos + n - int64_t(plan.prefix + plan.length) + history_output_reserve + 8;
                     if (needed < 4 * o.max_context) {
                         // Allocate and validate all host metadata before any authoritative device write.
                         auto compacted = std::vector<int32_t>(ids.begin(), ids.begin() + plan.prefix + plan.length);
-                        auto positions = mrope_host;
+                        auto positions = original_positions;
                         for (size_t j = 0; j < plan.length; ++j)
                             for (size_t k = 0; k < 3; ++k)
-                                positions[(plan.prefix+j)*3+k] = history_approximate
-                                    ? mrope_host[(plan.source+j)*3+k] : int32_t(plan.source+j);
+                                positions[(plan.prefix+j)*3+k] = mapped
+                                    ? original_positions[(plan.source+j)*3+k] : int32_t(plan.source+j);
                         for (size_t j = plan.prefix + plan.length; j < positions.size()/3; ++j)
                             for (size_t k = 0; k < 3; ++k)
                                 positions[j*3+k] = int32_t(next_pos + int64_t(j-plan.prefix-plan.length));
@@ -16858,7 +16869,7 @@ int main(int argc, char** argv) {
                             std::printf("FATAL history cache transition failed: %s\n", err.c_str());
                             std::fflush(stdout); return 1;
                         }
-                        live.swap(compacted); mrope_host.swap(positions);
+                        live.swap(compacted); live_imgs.clear(); mrope_host.swap(positions);
                         if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                             std::printf("FATAL history position upload failed\n"); std::fflush(stdout); return 1;
                         }

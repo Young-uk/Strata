@@ -3,6 +3,14 @@
 #include <iostream>
 int main() {
  using namespace strata::history;
+ struct Image { int64_t start; };
+ std::vector<int32_t> image_ids(2048, 1);
+ std::fill(image_ids.begin()+100,image_ids.begin()+300, 42);
+ assert(images_discarded(image_ids, std::vector<Image>{{100}}, Plan{64,768,768},42));
+ assert(!images_discarded(image_ids, std::vector<Image>{{100}}, Plan{128,768,768},42));
+ assert(!images_discarded(image_ids, std::vector<Image>{{100}}, Plan{64,200,768},42));
+ assert(!images_discarded(image_ids, std::vector<Image>{{800}}, Plan{64,768,768},42));
+ assert(!images_discarded(image_ids, std::vector<Image>{{-1}}, Plan{64,768,768},42));
  std::vector<int32_t> old(2048), next;
  for (size_t i=0;i<old.size();++i) old[i]=int32_t(i+1000);
  constexpr int32_t turn=99;

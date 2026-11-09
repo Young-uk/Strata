@@ -189,6 +189,26 @@ class PreparationTests(ClientTests):
         self.assertEqual(list(self.client.generate([1,2,3],2,{},self.cancel,embeddings='/tmp/image.bin')),[101,102])
         self.assertIn(' GENI /tmp/image.bin ',self.e.sent[0])
 
+    def test_completed_image_request_binds_processed_state_for_text_clone(self):
+        original = self.e._send_for
+        def send(generation, command):
+            if command.startswith('ANEXT'):
+                identity = command.split()[1]
+                self.e.sent.append(command)
+                self.e.lines.put(f'AT {identity} 102')
+                self.e.lines.put(f'ADONE {identity} stop 2')
+            else:
+                original(generation, command)
+        self.e._send_for = send
+        output = list(self.client.generate([1, 2, 3], 2, {'atomic_cache_owner': 'thread/image'},
+                                          self.cancel, embeddings='/tmp/image.bin'))
+        self.assertEqual(output, [101, 102])
+        snapshot = self.e.atomic_main_snapshot
+        self.assertEqual(snapshot['owner'], 'thread/image')
+        self.assertEqual(snapshot['ids'], [1, 2, 3, 101])
+        self.assertEqual(snapshot['tail'], 102)
+        self.assertNotIn('embeddings', snapshot)
+
     def test_failed_preparation_is_clean_error_not_false_complete(self):
         original=self.e._send_for
         def send(generation,command):

@@ -15,6 +15,20 @@ inline bool compact_rows(void* data, size_t bytes, size_t stride, size_t prefix,
     return true;
 }
 
+// Drop image ownership only if every image lies wholly outside retained rows.
+// The main cached positions still carry the visual observations until moved.
+template<class Image> inline bool images_discarded(const std::vector<int32_t>& ids,
+        const std::vector<Image>& images, const Plan& plan, int32_t pad) {
+    for (const auto& image : images) {
+        if (image.start < 0 || uint64_t(image.start) >= ids.size() || ids[size_t(image.start)] != pad) return false;
+        size_t end = size_t(image.start);
+        while (end < ids.size() && ids[end] == pad) ++end;
+        if (size_t(image.start) < plan.prefix ||
+            (size_t(image.start) < plan.source + plan.length && end > plan.source)) return false;
+    }
+    return true;
+}
+
 // Only explicit historical handoffs may use this approximation. Four-token
 // boundaries preserve the indexer's pooled keys without inventing raw keys.
 template<class T> inline Plan match(const std::vector<int32_t>& old, const std::vector<T>& next, int32_t turn) {
