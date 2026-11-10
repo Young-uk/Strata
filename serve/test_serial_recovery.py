@@ -49,6 +49,34 @@ class Recovery(unittest.TestCase):
         self.assertIsNone(self.scheduler.exclusive_owner)
         self.assertFalse(self.lane.poisoned)
 
+    def test_cold_emergency_saves_and_restores_without_allocating_a_bank(self):
+        self.lane.mode = 'state-bank-v1'
+        self.lane.disk_recovery_enabled = True
+        self.cancel._atomic_cold_summary = True
+        self.engine.atomic_main_snapshot = dict(self.cancel._atomic_clone_snapshot)
+        with self.lane.transaction(self.engine, self.cancel):
+            self.assertTrue(self.cancel._atomic_serial_recovery['cold'])
+            self.assertEqual(self.lane.transaction_mode, 'serial-disk-summary')
+            self.assertIs(self.scheduler.exclusive_owner, self.owner)
+            self.engine.main = 'independent summary'
+        self.assertEqual(self.engine.main, 'original')
+        self.assertEqual(self.engine.calls, ['save','restore'])
+        self.assertIsNone(self.scheduler.exclusive_owner)
+        self.assertFalse(self.lane.poisoned)
+
+    def test_restored_count_receipt_allows_cold_only_not_cache_append(self):
+        receipt = {'owner':'thread/turn','tokens':3}
+        self.cancel._atomic_clone_snapshot = receipt
+        self.engine.atomic_disk_restored_receipt = receipt
+        with self.assertRaises(SummaryError):
+            with self.lane.serial_recovery(self.engine, self.cancel):
+                self.fail('append requires complete token IDs')
+        self.assertEqual(self.engine.calls, [])
+        with self.lane.serial_recovery(self.engine, self.cancel, cold=True):
+            self.engine.main = 'independent text'
+        self.assertEqual(self.engine.calls, ['save','restore'])
+        self.assertEqual(self.engine.main, 'original')
+
     def test_cancellation_or_generation_error_restores_before_unsealing(self):
         with self.assertRaisesRegex(RuntimeError, 'generation failed'):
             with self.lane.serial_recovery(self.engine, self.cancel):

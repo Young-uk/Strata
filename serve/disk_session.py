@@ -107,6 +107,7 @@ class DiskSession:
 
     def restore(self, engine):
         engine.atomic_main_snapshot = None
+        engine.atomic_disk_restored_receipt = None
         try:
             record = self._record()
         except FileNotFoundError:
@@ -115,6 +116,12 @@ class DiskSession:
             return None
         engine.atomic_disk_owner = record.get('cache_owner')
         result = engine.session_file('restore', str(self.directory / record['file']))
+        # This is not a clone receipt: no token IDs, tail or semantic hash
+        # are invented. It can only preserve this known restored main while
+        # independent emergency text is evaluated and rolled back.
+        owner = record.get('cache_owner')
+        if isinstance(owner, str) and 0 < len(owner) <= 256 and result['tokens'] > 0:
+            engine.atomic_disk_restored_receipt = {'owner': owner, 'tokens': result['tokens']}
         binding = self._binding(record.get('clone_binding'), result['tokens'])
         # The native FORK also checks the committed token count and token hash.
         # Legacy manifests restore inference state but cannot claim a clone owner.

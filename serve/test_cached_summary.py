@@ -54,7 +54,7 @@ class CachedSummaryTests(unittest.TestCase):
         while True:
             try: next(turn)
             except StopIteration as result: release = result.value; break
-        self.assertEqual(scheduler.summary_input_quantum(owner), 128)
+        self.assertEqual(scheduler.summary_input_quantum(owner), 2048)
         self.assertEqual(scheduler.summary_input_quantum(owner, cached=True), 2048)
         foreground = admit(False)
         self.assertEqual(scheduler.summary_input_quantum(owner, cached=True), 1)

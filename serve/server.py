@@ -6645,11 +6645,28 @@ class Service:
                         if (par and not cooperative) or thinking or tools or len(ids) + max_new + CTX_SLACK > (self.engine.max_context if sampling.get("atomic_summary_clone") else atomic_summary.CONTEXT):
                             raise ValueError("summary requires isolated text-only 16K context and thinking disabled")
                         clone_owner = sampling.get("atomic_summary_clone")
+                        cold_owner = sampling.get("atomic_summary_cold_recovery")
+                        if cold_owner is not None:
+                            snapshot = (getattr(self.engine, "atomic_main_snapshot", None) or
+                                        getattr(self.engine, "atomic_disk_restored_receipt", None))
+                            if not snapshot or snapshot["owner"] != cold_owner:
+                                raise atomic_summary.SummaryError("Foreground cache changed before cold summary; originals retained", 409,
+                                    "atomic_summary_clone_stale")
+                            cancel._atomic_clone_snapshot = dict(snapshot)
+                            cancel._atomic_cold_summary = True
                         if clone_owner is not None:
                             snapshot = getattr(self.engine, "atomic_main_snapshot", None)
+                            restored = getattr(self.engine, "atomic_disk_restored_receipt", None)
+                            if (not snapshot and restored and restored["owner"] == clone_owner and
+                                    restored["tokens"] + 1 + len(ids) + max_new + CTX_SLACK > self.engine.max_context):
+                                raise atomic_summary.SummaryError("Summary cache has insufficient context headroom; originals retained", 409,
+                                    "atomic_summary_headroom_exhausted")
                             if not getattr(self.summary_lane, "clone_enabled", False) or not snapshot or snapshot["owner"] != clone_owner:
                                 raise atomic_summary.SummaryError("The requested foreground cache is no longer current; originals retained", 409,
                                     "atomic_summary_clone_stale")
+                            if snapshot["tokens"] + 1 + len(ids) + max_new + CTX_SLACK > self.engine.max_context:
+                                raise atomic_summary.SummaryError("Summary cache has insufficient context headroom; originals retained", 409,
+                                    "atomic_summary_headroom_exhausted")
                             cancel._atomic_clone_snapshot = dict(snapshot)
                         try:
                             turn.enter_context(self.summary_lane.transaction(self.engine, cancel))
@@ -6770,6 +6787,12 @@ class Service:
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
                             print(f"[strata] the engine reported an error: {e}", flush=True)
+                            if sampling.get("atomic_summary_clone") and str(e) in (
+                                    "serial recovery token headroom exhausted",
+                                    "serial recovery absolute-position headroom exhausted",
+                                    "clone absolute-position headroom exhausted or already consumed"):
+                                raise atomic_summary.SummaryError("Summary cache has insufficient context headroom; originals retained", 409,
+                                    "atomic_summary_headroom_exhausted") from e
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this

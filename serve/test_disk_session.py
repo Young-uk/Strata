@@ -30,6 +30,14 @@ class DiskTests(unittest.TestCase):
         self.cache.restore(fresh)
         self.assertEqual(fresh.atomic_main_snapshot, {**binding, 'restored':True})
 
+    def test_restored_owner_and_count_never_invent_clone_ids_or_history(self):
+        self.engine.atomic_disk_owner = 'thread/turn'
+        self.cache.save(self.service())
+        fresh = Engine()
+        self.cache.restore(fresh)
+        self.assertIsNone(fresh.atomic_main_snapshot)
+        self.assertEqual(fresh.atomic_disk_restored_receipt, {'owner':'thread/turn','tokens':123})
+
     def test_old_manifest_cannot_inherit_stale_memory_owner(self):
         self.cache.save(self.service())
         self.engine.atomic_main_snapshot = {'owner':'wrong'}

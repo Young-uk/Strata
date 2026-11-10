@@ -75,6 +75,17 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(self.e.sent[0].endswith('1,2,3,4'))
         self.assertFalse(any(command.startswith('AFORK ') for command in self.e.sent))
 
+    def test_disk_preserved_cold_summary_uses_legacy_text_preparation_not_full_cache(self):
+        self.s.close(self.owner)
+        self.owner = exhaust(self.s.admit(True, self.cancel, recovery=True))
+        self.cancel._priority_owner = self.owner
+        self.cancel._atomic_serial_recovery = {"ids": [1, 2], "tokens": 2, "tail": 3, "cold": True}
+        self.assertEqual(list(self.client.generate([4, 5, 6], 2, {}, self.cancel)), [101, 102])
+        self.assertTrue(self.e.sent[0].startswith('APREP '))
+        self.assertIn(' GEN ckpt=0 ', self.e.sent[0])
+        self.assertTrue(self.e.sent[0].endswith('4,5,6'))
+        self.assertFalse(any(command.startswith(('ARECOVER ', 'AFORK ', 'AGEN ')) for command in self.e.sent))
+
     def test_capability_exact(self): self.client.discover()
 
     def test_two_tokens_no_stop_or_replay(self):

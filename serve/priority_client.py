@@ -225,7 +225,11 @@ class ContinuationClient:
                   "decode_ms": None, "reused": 0, "prompt_read": 0, "finish": "cancel"}
         serial = getattr(cancel, "_atomic_serial_recovery", None) if owner.summary else None
         clone = getattr(cancel, "_atomic_clone_snapshot", None) if owner.summary and not serial else None
-        if serial:
+        if serial and serial.get("cold"):
+            # APREP runs the ordinary one-shot text parser, which accepts
+            # ckpt=0. Do not build temporary conversation checkpoints here.
+            keys = (keys + " ckpt=0").strip()
+        if serial and not serial.get("cold"):
             ids = [*serial["ids"], serial["tail"], *ids]
         # Previously only finished text requests were recorded. Interrupted work must
         # invalidate the former owner before it can be mistaken for this cache.
@@ -234,6 +238,7 @@ class ContinuationClient:
         emitted = []
         cache_owner = sampling.get("atomic_cache_owner") if not owner.summary else None
         if not owner.summary:
+            self.engine.atomic_disk_restored_receipt = None
             self.engine.atomic_main_snapshot = None
             self.engine.atomic_disk_owner = cache_owner
         if clone:
@@ -256,7 +261,7 @@ class ContinuationClient:
                 started()
             cancel._strata_queue_deadline = None
         try:
-            if owner.summary:
+            if owner.summary and not (serial and serial.get("cold")):
                 release = yield from self.scheduler.turn(owner)
                 try:
                     self.check_generation()

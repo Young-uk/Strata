@@ -37,6 +37,11 @@ def request(req, *, count=False):
     if "atomic_summary_clone" in req and (not isinstance(req["atomic_summary_clone"], str) or
         re.fullmatch(r"[A-Za-z0-9_:/.-]{1,256}", req["atomic_summary_clone"]) is None):
         raise ValueError("invalid cached summary owner")
+    if "atomic_summary_cold_recovery" in req:
+        owner = req["atomic_summary_cold_recovery"]
+        if (not isinstance(owner, str) or re.fullmatch(r"[A-Za-z0-9_:/.-]{1,256}", owner) is None
+                or req.get("atomic_summary_recovery") is not True or req.get("atomic_summary_clone") is not None):
+            raise ValueError("cold summary requires an urgent, non-cloned bound owner")
     if "atomic_background_task" in req and type(req["atomic_background_task"]) is not bool:
         raise ValueError("atomic_background_task must be a boolean")
     if "atomic_summary_recovery" in req and type(req["atomic_summary_recovery"]) is not bool:
@@ -419,7 +424,7 @@ class SummaryLane:
                     self.foreground -= 1
 
     @contextlib.contextmanager
-    def serial_recovery(self, engine, cancel):
+    def serial_recovery(self, engine, cancel, *, cold=False):
         """Emergency single-state work, sealed by a verified disk rollback.
 
         Only a bound complete token receipt qualifies. Never replay partial or
@@ -428,7 +433,8 @@ class SummaryLane:
         scheduler = self.scheduler
         owner = getattr(cancel, "_priority_owner", None)
         snapshot = getattr(cancel, "_atomic_clone_snapshot", None)
-        if not scheduler or not owner or not owner.recovery or not snapshot or                 not isinstance(snapshot.get("ids"), list) or len(snapshot["ids"]) != snapshot.get("tokens"):
+        if (not scheduler or not owner or not owner.recovery or not snapshot or
+                (not cold and (not isinstance(snapshot.get("ids"), list) or len(snapshot["ids"]) != snapshot.get("tokens")))):
             raise SummaryError("A complete current conversation cache is required for disk recovery; originals retained", 409,
                                "atomic_summary_admission_refused")
         path = None
@@ -444,19 +450,20 @@ class SummaryLane:
                                            "atomic_summary_admission_refused")
                     scheduler.exclusive_owner = owner
                     held = True
-                current = getattr(engine, "atomic_main_snapshot", None)
+                current = getattr(engine, "atomic_main_snapshot", None) or (
+                    getattr(engine, "atomic_disk_restored_receipt", None) if cold else None)
                 if current is not None and any(current.get(key) != snapshot.get(key) for key in ("owner", "tokens", "hash")):
                     raise SummaryError("Conversation cache changed before disk recovery; originals retained", 409,
                                        "atomic_summary_clone_stale")
                 fd, path = tempfile.mkstemp(prefix="atomic-recovery-", suffix=".session")
                 os.close(fd)
                 self.phase = "saving"
-                self.transaction_mode = "serial-disk-recovery"
+                self.transaction_mode = "serial-disk-summary" if cold else "serial-disk-recovery"
                 saved = engine.session_file("save", path)
                 if saved.get("tokens") != snapshot["tokens"] or saved.get("bytes", 0) <= 0:
                     raise ValueError("recovery snapshot does not match the bound main cache")
-                cancel._atomic_serial_recovery = snapshot
-                self.transaction_mode = "serial-disk-recovery"
+                cancel._atomic_serial_recovery = {**snapshot, "cold": cold}
+                self.transaction_mode = "serial-disk-summary" if cold else "serial-disk-recovery"
                 self.phase = "generating"
             try:
                 yield
@@ -539,6 +546,12 @@ class SummaryLane:
         bank = self.mode == "state-bank-v1"
         txid = uuid.uuid4().hex if bank else None
         try:
+            if getattr(cancel, "_atomic_cold_summary", False):
+                if not getattr(self, "disk_recovery_enabled", False):
+                    raise SummaryError("Disk-preserved cold summary is not qualified on this runtime", 409)
+                with self.serial_recovery(engine, cancel, cold=True):
+                    yield
+                return
             if not bank:
                 fd, path = tempfile.mkstemp(prefix="atomic-main-", suffix=".session", dir=self.directory)
                 os.close(fd)

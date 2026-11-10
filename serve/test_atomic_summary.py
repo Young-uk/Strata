@@ -291,6 +291,59 @@ class Api(unittest.TestCase):
                 self.assertNotIn("generate", self.engine.calls)
                 self.assertFalse(self.svc.summary_lane.poisoned)
 
+    def test_cold_recovery_rejects_stale_owner_and_mixed_clone_before_generation(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.engine.atomic_main_snapshot = {"owner":"thread/current", "tokens":12, "hash":7, "ids":list(range(12)), "tail":4}
+        payload = {**BODY, "atomic_summary_cold_recovery":"thread/old", "atomic_summary_recovery":True}
+        status, body = self.call('/v1/chat/completions', payload)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body['error']['code'], 'atomic_summary_clone_stale')
+        status, body = self.call('/v1/chat/completions', {**payload, "atomic_summary_clone":"thread/current"})
+        self.assertEqual(status, 400, body)
+        self.assertNotIn('generate', self.engine.calls)
+        self.assertNotIn('save', self.engine.calls)
+
+    def test_streamed_headroom_refusal_keeps_its_structured_code(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.atomic_main_snapshot = {"owner":"thread/turn", "tokens":65500, "hash":7, "ids":[1], "tail":4}
+        conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=10)
+        try:
+            conn.request("POST", "/v1/chat/completions", json.dumps({**BODY,"stream":True,"atomic_summary_clone":"thread/turn"}), {"Content-Type":"application/json"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            wire = response.read().decode()
+            self.assertIn('atomic_summary_headroom_exhausted', wire)
+        finally:
+            conn.close()
+        self.assertNotIn('generate', self.engine.calls)
+        self.assertNotIn('save', self.engine.calls)
+
+    def test_known_restored_owner_can_report_capacity_without_claiming_clone_binding(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.atomic_main_snapshot = None
+        self.engine.atomic_disk_restored_receipt = {'owner':'thread/turn','tokens':65500}
+        payload = {**BODY,'atomic_summary_clone':'thread/turn'}
+        status, body = self.call('/v1/chat/completions', payload)
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body['error']['code'], 'atomic_summary_headroom_exhausted')
+        status, body = self.call('/v1/chat/completions', {**payload,'atomic_summary_clone':'thread/other'})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body['error']['code'], 'atomic_summary_clone_stale')
+        self.assertIsNone(self.engine.atomic_main_snapshot)
+        self.assertNotIn('save',self.engine.calls)
+
+    def test_bound_summary_headroom_is_refused_before_allocating_or_saving(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.engine.atomic_main_snapshot = {"owner":"thread/turn", "tokens":65500, "hash":7, "ids":[1], "tail":4}
+        self.svc.summary_lane.clone_enabled = True
+        status, body = self.call('/v1/chat/completions', {**BODY, "atomic_summary_clone":"thread/turn"})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body['error']['code'], 'atomic_summary_headroom_exhausted')
+        self.assertNotIn('generate', self.engine.calls)
+        self.assertNotIn('save', self.engine.calls)
+
     def test_clean_memory_refusal_keeps_bound_cache_for_retry(self):
         receipt = {"owner": "thread/turn", "tokens": 3, "hash": 7, "ids": [1,2,3], "tail": 4}
         self.engine.atomic_main_snapshot = receipt
