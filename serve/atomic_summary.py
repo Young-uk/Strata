@@ -21,7 +21,7 @@ from pathlib import Path
 from serve.priority import PriorityCancelled
 
 CONTEXT = 16384
-OUTPUT = 2048
+OUTPUT = 0  # Standard server convention: use the remaining context, not a prose target.
 
 
 class SummaryError(RuntimeError):
@@ -64,8 +64,8 @@ def request(req, *, count=False):
         elif not isinstance(content, str):
             raise ValueError("summary messages must contain only text")
     cap = req.get("max_tokens", OUTPUT)
-    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= OUTPUT:
-        raise ValueError(f"summary max_tokens must be between 1 and {OUTPUT}")
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        raise ValueError("summary max_tokens must be a nonnegative integer (0 uses remaining context)")
     if "stream" in req and type(req["stream"]) is not bool:
         raise ValueError("summary stream must be a boolean")
     # Do not inherit foreground thinking, MCP, or cache hints. Exact same kwargs

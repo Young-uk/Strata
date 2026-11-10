@@ -313,8 +313,8 @@ class EngineOutputDecoding(FakeEngines, unittest.TestCase):
         script = Path(self.tmp.name) / "fake_strata.py"
         script.write_text(text, encoding="utf-8")
         real = server.subprocess.Popen
-        self.popen_patch = mock.patch.object(server.subprocess, "Popen",
-                                             lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw))
+        self.popen_patch = mock.patch.object(server, "popen",
+                                             lambda role, cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw))
         self.popen_patch.start()
         engine = StrataEngine("strata", [])
         self.engines = [engine]

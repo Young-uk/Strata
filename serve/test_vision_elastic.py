@@ -245,6 +245,12 @@ class OnDemandByDefault(unittest.TestCase):
     BASE = {"args": ["--max-context", "8192", "--vision"], "gpu": 0,
             "vision": {"exe": "/e/strata-vision", "mmproj": "m", "model": "t", "gpu": True, "max_tokens": 1024}}
 
+    def setUp(self):
+        # These cases describe CUDA/HIP defaults, not the host's Mac policy.
+        platform = mock.patch("serve.server.sys.platform", "linux")
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def cfg(self, **over):
         import copy
         c = copy.deepcopy(self.BASE)
@@ -254,6 +260,11 @@ class OnDemandByDefault(unittest.TestCase):
             else:
                 c[k] = v
         return c
+
+    def test_mac_keeps_the_existing_reader_policy(self):
+        from serve.server import vision_on_demand_by_default
+        with mock.patch("serve.server.sys.platform", "darwin"):
+            self.assertFalse(vision_on_demand_by_default(self.cfg()))
 
     def test_the_plain_nvidia_config_is_on_demand(self):
         from serve.server import apply_vision_defaults, vision_on_demand_by_default

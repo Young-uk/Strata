@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -52,9 +53,11 @@ class Roles(unittest.TestCase):
         self.assertEqual(gpu_list(cfg), [])
         env = child_env(cfg)
         self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["HIP_VISIBLE_DEVICES"]), ("", ""))
-        with self.assertRaises(SystemExit) as e:
+        with mock.patch("serve.server.sys.platform", "linux"), self.assertRaises(SystemExit) as e:
             card_roles_lines(cfg)                                                   # a CUDA engine cannot start without a card: said plainly
         self.assertIn("Turn a card on", str(e.exception))
+        with mock.patch("serve.server.sys.platform", "darwin"):
+            self.assertIn("Performance is degraded on CPU only.", card_roles_lines(cfg)[0])
         cpu = card_roles_lines({**cfg, "backend": "cpu"})
         self.assertIn("Performance is degraded on CPU only.", cpu[0])
 

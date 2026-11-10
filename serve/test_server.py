@@ -6462,6 +6462,7 @@ class OpenAIChunksTerminal(unittest.TestCase):
     def service(self, engine):
         svc = object.__new__(Service)
         svc.engine, svc.fifo = engine, threading.Lock()
+        svc.summary_lane = SimpleNamespace(scheduler=None)
         return svc
 
     class Engine:

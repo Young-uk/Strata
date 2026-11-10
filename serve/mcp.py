@@ -190,6 +190,11 @@ class StdioTransport:
 
     def request(self, method: str, params: dict, timeout: float, cancel=None):
         if not self.alive():
+            # A short-lived child may exit before initialize is sent. As in
+            # _read(), collect its final diagnostic before reporting failure.
+            reader = getattr(self, "_err_reader", None)
+            if reader is not None:
+                reader.join(1.0)
             raise McpError(f"the server is not running{self._tail()}")
         slot = _Slot()
         with self.lock:

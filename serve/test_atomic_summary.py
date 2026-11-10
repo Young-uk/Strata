@@ -496,11 +496,55 @@ class Api(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "atomic_summary_recovery_required")
 
     def test_invalid_summary_inputs(self):
-        for update in ({"think": True}, {"max_tokens": 0}, {"max_tokens": 2049}, {"max_tokens": True},
+        for update in ({"think": True}, {"max_tokens": -1}, {"max_tokens": 1.5}, {"max_tokens": True},
                        {"tools": [{"type": "function"}]}, {"messages": [{"role": "tool", "content": "hi"}]},
                        {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}):
             with self.subTest(update=update):
                 self.assertEqual(self.call("/v1/atomic/summary-token-count", {**BODY, **update})[0], 400)
+
+    def test_summary_output_can_use_remaining_context(self):
+        self.assertEqual(request({**BODY, "max_tokens": 0})["max_tokens"], 0)
+        self.assertEqual(request({**BODY, "max_tokens": 4096})["max_tokens"], 4096)
+        no_cap = {k: v for k, v in BODY.items() if k != "max_tokens"}
+        self.assertEqual(request(no_cap)["max_tokens"], 0)
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.engine.script = self.tok.encode('abcdefghij' * 260) + self.tok.encode('<|im_end|>', parse_special=True)
+        status, result = self.call("/v1/chat/completions", {**BODY, "max_tokens": 0})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(len(result["choices"][0]["message"]["content"]), 2600)
+
+    def test_cached_auto_output_subtracts_the_bound_prefix(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.atomic_main_snapshot = {"owner": "thread/turn", "tokens": 60000, "hash": 19, "tail": 2}
+        self.engine.script = self.tok.encode('abcdefghij' * 260) + self.tok.encode('<|im_end|>', parse_special=True)
+        status, result = self.call("/v1/chat/completions", {**BODY, "max_tokens": 0, "atomic_summary_clone": "thread/turn"})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(len(result["choices"][0]["message"]["content"]), 2600)
+        self.assertGreater(self.svc.status["max_tokens"], 2048)
+        self.assertLess(self.svc.status["max_tokens"], self.engine.max_context - 60000)
+
+    def test_cached_auto_output_refuses_only_when_no_physical_room_remains(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.atomic_main_snapshot = {"owner": "thread/turn", "tokens": 65530, "hash": 19, "tail": 2}
+        status, result = self.call("/v1/chat/completions", {**BODY, "max_tokens": 0, "atomic_summary_clone": "thread/turn"})
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["error"]["code"], "atomic_summary_headroom_exhausted")
+        self.assertNotIn("generate", self.engine.calls)
+        self.assertFalse(self.svc.summary_lane.poisoned)
+        self.assertIsNone(self.svc.summary_lane.active)
+
+    def test_count_only_restored_receipt_keeps_the_cold_recovery_path(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.atomic_disk_restored_receipt = {"owner": "thread/turn", "tokens": 60000}
+        status, result = self.call("/v1/chat/completions", {**BODY, "max_tokens": 0, "atomic_summary_clone": "thread/turn"})
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["error"]["code"], "atomic_summary_headroom_exhausted")
+        self.assertNotIn("generate", self.engine.calls)
 
     def test_raw_count_accepts_no_max_tokens_and_unicode(self):
         status, body = self.call("/v1/atomic/summary-token-count", {
