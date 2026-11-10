@@ -135,6 +135,8 @@ def model_fingerprint(cfg):
             "atomic_summary_mode", "atomic_summary_clone_enabled", "atomic_summary_state_bank_enabled",
             "atomic_summary_state_bank_max_bytes", "atomic_summary_state_bank_provenance",
             "atomic_summary_scheduler", "atomic_summary_foreground_weight")}
+        if cfg.get("atomic_summary_checkpoint_enabled") is True:
+            payload["state_bank"]["atomic_summary_checkpoint_enabled"] = True
     return "strata-stat-v2:" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -433,6 +435,7 @@ class SummaryLane:
         scheduler = self.scheduler
         owner = getattr(cancel, "_priority_owner", None)
         snapshot = getattr(cancel, "_atomic_clone_snapshot", None)
+        if snapshot: snapshot = snapshot.get("main_snapshot", snapshot)
         if (not scheduler or not owner or not owner.recovery or not snapshot or
                 (not cold and (not isinstance(snapshot.get("ids"), list) or len(snapshot["ids"]) != snapshot.get("tokens")))):
             raise SummaryError("A complete current conversation cache is required for disk recovery; originals retained", 409,

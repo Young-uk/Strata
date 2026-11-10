@@ -88,3 +88,37 @@ def choose_boundary(snapshot, owner, candidates, encode, turn, context):
         if match:
             return {'boundary': boundary, 'reason': 'aligned', **match}
     return {'boundary': None, 'reason': 'no-budgeted-aligned-turn'}
+
+
+def summary_checkpoint(snapshot, owner, prefix, candidates, capacity, task_tokens, image_pad=None, history_hash=None):
+    """Select a real checkpoint covering every archived token; never replay image rows.
+
+    The CPU template is matched exactly to committed IDs. Image placeholder runs
+    may expand only with the completed-history receipt, not by a text heuristic.
+    Choosing at/after the source end avoids a partial-state replay entirely.
+    """
+    if not snapshot or snapshot.get('owner') != owner or not prefix:
+        return None
+    old = snapshot.get('ids')
+    if not isinstance(old, list) or len(old) != snapshot.get('tokens'):
+        return None
+    at = 0
+    for token in prefix:
+        if at >= len(old) or old[at] != token:
+            return None
+        at += 1
+        if token == image_pad:
+            if not history_hash or history_hash != snapshot.get('history_hash'):
+                return None
+            while at < len(old) and old[at] == image_pad:
+                at += 1
+    # Prefer enough room for a natural summary. This selects a checkpoint; it
+    # never sets an output cap. The decoder receives all remaining physical room.
+    for count, digest in sorted(candidates):
+        if (type(count) is not int or not at <= count < len(old) or
+                capacity - count - task_tokens - 1 - 8 < 4096 or
+                digest != token_hash(old[:count])):
+            continue
+        return {**snapshot, 'tokens': count, 'hash': digest, 'ids': old[:count],
+                'tail': old[count], 'main_snapshot': snapshot, 'source_tokens': at}
+    return None

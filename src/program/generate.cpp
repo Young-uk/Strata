@@ -5337,7 +5337,20 @@ int main(int argc, char** argv) {
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
     if (o.vision) {
-        const int64_t cells = o.max_context + 64;
+        int64_t cells = o.max_context + 64;
+#if defined(STRATA_GPU_METAL)
+        uint64_t reserve_cells = 0, physical_cells = 0;
+        if (const char* reserve = std::getenv("STRATA_ATOMIC_SUMMARY_HEADROOM_TOKENS")) {
+            const auto parsed = std::from_chars(reserve, reserve + std::strlen(reserve), reserve_cells);
+            if (parsed.ec != std::errc{} || parsed.ptr != reserve + std::strlen(reserve)) {
+                std::fprintf(stderr, "strata generate: invalid summary position headroom\n"); return 1;
+            }
+        }
+        if (!strata::core::SummaryStateBank::physical_capacity((uint64_t)o.max_context, reserve_cells, physical_cells)) {
+            std::fprintf(stderr, "strata generate: invalid summary position capacity\n"); return 1;
+        }
+        cells = (int64_t)physical_cells;
+#endif
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
@@ -14012,6 +14025,9 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
+#if defined(STRATA_GPU_METAL)
+                        "summary_checkpoint=1 "
+#endif
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
@@ -15631,13 +15647,17 @@ int main(int argc, char** argv) {
                     if (arecover && (!recovery_prefix || continuations[1].active())) {
                         refused("recovery", "serial recovery requires the exact idle main prefix without a summary bank"); continue;
                     }
-                    if (recovery_prefix && (uint64_t(incoming.ids.size()) + incoming.limit + 8 > uint64_t(o.max_context))) {
+                    uint64_t recovery_capacity = (uint64_t)o.max_context;
+#if defined(STRATA_GPU_METAL)
+                    if (recovery_prefix) recovery_capacity = strata::metal_engine::window_summary_capacity();
+#endif
+                    if (recovery_prefix && (uint64_t(incoming.ids.size()) + incoming.limit + 8 > recovery_capacity)) {
                         refused("bounds", "serial recovery token headroom exhausted"); continue;
                     }
                     if (recovery_prefix) {
                         const uint64_t next_position = d_mrope ? uint64_t(mrope_host[live.size()*3]) : live.size();
                         if (!strata::core::SummaryStateBank::clone_room(next_position,
-                                incoming.ids.size() - live.size(), incoming.limit, (uint64_t)o.max_context)) {
+                                incoming.ids.size() - live.size(), incoming.limit, (uint64_t)o.max_context, recovery_capacity)) {
                             refused("bounds", "serial recovery absolute-position headroom exhausted"); continue;
                         }
                     }
@@ -15652,15 +15672,15 @@ int main(int argc, char** argv) {
                         // Append instructions directly to the frozen committed token sequence.
                         // No retokenization or replay of the conversation is involved.
                         const auto& frozen = continuation_summary_selected ? live : summary_bank_live;
-                        if (frozen.size() != summary_bank.main_tokens ||
+                        if (frozen.size() != summary_bank.clone_tokens ||
                             !strata::core::SummaryStateBank::clone_room(summary_clone_next_position,
-                                incoming.ids.size(), incoming.limit, (uint64_t)o.max_context)) {
+                                incoming.ids.size(), incoming.limit, (uint64_t)o.max_context, summary_bank.context)) {
                             refused("bounds", "clone absolute-position headroom exhausted or already consumed"); continue;
                         }
                         incoming.ids.insert(incoming.ids.begin(), frozen.begin(), frozen.end());
                         incoming.origin = incoming.ids.size(); incoming.penalty_origin = incoming.origin - 1;
                     }
-                    const uint64_t cap = incoming.summary ? summary_bank.context : (uint64_t)o.max_context;
+                    const uint64_t cap = incoming.summary ? summary_bank.context : recovery_capacity;
                     if (incoming.origin + incoming.limit + 8 > cap || incoming.sampler.penalty_last_n > kPenaltyWindowCap) {
                         refused("bounds", "prompt and output exceed lane or penalty capacity"); continue;
                     }
@@ -15823,7 +15843,14 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
                 capable = summary_supported() && strata::metal_engine::window_summary_supported();
 #endif
-                std::printf("SUMMARY_CLONE_CAPS %d %lld\n", capable ? 1 : 0, (long long)o.max_context);
+                uint64_t clone_capacity = (uint64_t)o.max_context;
+#if defined(STRATA_GPU_METAL)
+                if (capable) clone_capacity = strata::metal_engine::window_summary_capacity();
+#endif
+                // The logical foreground context is unchanged. A clone may use
+                // only the physical cells the native window actually allocated.
+                std::printf("SUMMARY_CLONE_CAPS %d %lld %llu\n", capable ? 1 : 0,
+                            (long long)o.max_context, (unsigned long long)clone_capacity);
                 std::fflush(stdout); continue;
             }
             if (line == "SUMMARY_STATE_CAPS") {
@@ -15943,14 +15970,37 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
-            const bool state_fork = line.rfind("SUMMARY_STATE_FORK ", 0) == 0;
+            if (line.rfind("SUMMARY_CHECKPOINTS ", 0) == 0) {
+                uint64_t budget = 0, count = 0, hash = 0; std::string query;
+                const bool valid = strata::core::SummaryStateBank::parse_fork(
+                    "1 Query " + line.substr(20), budget, query, count, hash);
+                if (!valid || summary_bank.active() || !live_ok || count != live.size() ||
+                    hash != strata::core::SummaryStateBank::token_hash(live) || continuations[0].active()) {
+                    std::printf("SUMMARY_CHECKPOINTS_REFUSED stale-or-busy\n");
+                } else {
+                    strata::core::conversation_checkpoint_join(nullptr);
+                    std::printf("SUMMARY_CHECKPOINTS %llu %llu", (unsigned long long)count, (unsigned long long)hash);
+                    for (const auto& c : checks) {
+                        if (c.ids.empty() || c.ids.size() >= live.size() || !c.stage_parts.empty() ||
+                            !std::equal(c.ids.begin(), c.ids.end(), live.begin())) continue;
+                        std::printf(" %llu %llu", (unsigned long long)c.ids.size(),
+                            (unsigned long long)strata::core::SummaryStateBank::token_hash(c.ids));
+                    }
+                    std::printf("\n");
+                }
+                std::fflush(stdout); continue;
+            }
+            const bool state_checkpoint = line.rfind("SUMMARY_STATE_CHECKPOINT ", 0) == 0;
+            const bool state_fork = line.rfind("SUMMARY_STATE_FORK ", 0) == 0 || state_checkpoint;
             const bool state_begin = line.rfind("SUMMARY_STATE_BEGIN ", 0) == 0 || state_fork;
             const bool state_end = line.rfind("SUMMARY_STATE_END ", 0) == 0;
             if (state_begin || state_end) {
-                uint64_t budget = 0, fork_tokens = 0, fork_hash = 0;
+                uint64_t budget = 0, fork_tokens = 0, fork_hash = 0, prefix_tokens = 0, prefix_hash = 0;
                 std::string txid;
                 const bool parsed = state_begin
-                    ? (state_fork ? strata::core::SummaryStateBank::parse_fork(line.substr(19), budget, txid, fork_tokens, fork_hash)
+                    ? (state_checkpoint ? strata::core::SummaryStateBank::parse_checkpoint(line.substr(25), budget, txid,
+                          fork_tokens, fork_hash, prefix_tokens, prefix_hash)
+                       : state_fork ? strata::core::SummaryStateBank::parse_fork(line.substr(19), budget, txid, fork_tokens, fork_hash)
                                   : strata::core::SummaryStateBank::parse_begin(line.substr(20), budget, txid))
                     : strata::core::SummaryStateBank::valid_id(txid = line.substr(18));
                 auto refuse_state = [&](const std::string& reason) {
@@ -15971,10 +16021,20 @@ int main(int argc, char** argv) {
                         fork_hash != strata::core::SummaryStateBank::token_hash(live))) {
                         refuse_state("foreground cache changed before clone admission"); continue;
                     }
+                    const ConvCheckpoint* selected_checkpoint = nullptr;
+                    if (state_checkpoint) {
+                        strata::core::conversation_checkpoint_join(nullptr);
+                        for (const auto& c : checks)
+                            if (c.ids.size() == prefix_tokens && c.stage_parts.empty() &&
+                                std::equal(c.ids.begin(), c.ids.end(), live.begin()) &&
+                                strata::core::SummaryStateBank::token_hash(c.ids) == prefix_hash)
+                                selected_checkpoint = &c;
+                        if (!selected_checkpoint) { refuse_state("summary checkpoint changed before admission"); continue; }
+                    }
                     // Copy host token/position ownership before any bank publication.
                     std::vector<int32_t> fork_live;
                     if (state_fork) {
-                        try { fork_live = live; } catch (const std::bad_alloc&) {
+                        try { fork_live = selected_checkpoint ? selected_checkpoint->ids : live; } catch (const std::bad_alloc&) {
                             refuse_state("summary clone token allocation refused"); continue;
                         }
                     }
@@ -15996,8 +16056,21 @@ int main(int argc, char** argv) {
                     // Allocate transaction identity before native publication; subsequent ownership swaps cannot allocate.
                     std::string owned_id = txid;
                     bool begun = false;
+                    // Keep original positions through the checkpoint, then assign
+                    // the new text suffix from its next absolute position. Later
+                    // foreground image positions do not belong to this branch.
+                    std::vector<int32_t> fork_positions;
+                    if (selected_checkpoint && position_bytes) {
+                        fork_positions = mrope_host;
+                        const size_t start = fork_live.size();
+                        const int64_t next = mrope_host[start * 3];
+                        for (size_t i = start; i < fork_positions.size() / 3; ++i)
+                            for (size_t axis = 0; axis < 3; ++axis)
+                                fork_positions[i * 3 + axis] = int32_t(next + int64_t(i - start));
+                    }
+                    const int32_t* fork_position_data = fork_positions.empty() ? mrope_host.data() : fork_positions.data();
                     if (position_bytes && (cudaMalloc(&summary_clone_positions, position_bytes) != cudaSuccess ||
-                        cudaMemcpy(summary_clone_positions, mrope_host.data(), position_bytes, cudaMemcpyHostToDevice) != cudaSuccess)) {
+                        cudaMemcpy(summary_clone_positions, fork_position_data, position_bytes, cudaMemcpyHostToDevice) != cudaSuccess)) {
                         if (summary_clone_positions) cudaFree(summary_clone_positions);
                         summary_clone_positions = nullptr;
                         refuse_state("summary clone position allocation refused"); continue;
@@ -16009,10 +16082,13 @@ int main(int argc, char** argv) {
                         summary_clone_positions = nullptr;
                         refuse_state(err); continue;
                     }
+                    if (selected_checkpoint && !checkpoint_restore(*selected_checkpoint, ss, g)) {
+                        std::printf("FATAL summary checkpoint restore failed\n"); std::fflush(stdout); return 1;
+                    }
                     summary_bank_cloned = state_fork;
                     summary_bank.context = state_fork ? strata::metal_engine::window_summary_capacity() : 16384;
                     summary_clone_next_position = state_fork
-                        ? ((history_approximate || !mrope_identity) ? uint64_t(mrope_host[live.size()*3]) : live.size()) : 0;
+                        ? ((history_approximate || !mrope_identity) ? uint64_t(mrope_host[fork_live.size()*3]) : fork_live.size()) : 0;
                     if (state_fork && summary_clone_positions) strata::kernels::mrope_table_set(summary_clone_positions);
                     summary_bank_live.swap(live); summary_bank_imgs.swap(live_imgs);
                     summary_bank_live_ok = live_ok; live_ok = state_fork;
@@ -16036,7 +16112,8 @@ int main(int argc, char** argv) {
                     o.prompt_cache = 0;
                     summary_bank.id.swap(owned_id); ++summary_bank.epoch;
                     continuation_summary_selected = true; summary_bank_nan = false;
-                    summary_bank.main_tokens = summary_bank_live.size(); summary_bank.allocated_bytes = bytes;
+                    summary_bank.main_tokens = summary_bank_live.size(); summary_bank.clone_tokens = state_fork ? live.size() : 0;
+                    summary_bank.allocated_bytes = bytes;
                     std::fprintf(stderr, "strata summary state: held epoch %llu, main %llu tokens, slot %llu bytes, shared weights, serial compute, cloned=%d\n",
                         (unsigned long long)summary_bank.epoch, (unsigned long long)summary_bank.main_tokens, (unsigned long long)bytes, state_fork ? 1 : 0);
                 } else {
@@ -16379,7 +16456,9 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why,
+                            std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS") &&
+                            std::string(std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS")) == "1" ? 3 : 1)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }

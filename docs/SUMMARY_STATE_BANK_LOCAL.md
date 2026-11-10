@@ -81,3 +81,62 @@ It validates grammar, bounds and protocol gating, not GPU isolation or output pa
 No model load, real inference, long stress run or recovery inference was performed for this
 implementation. User testing is required. In particular, image/main-cache preservation,
 cancel/preemption, pressure/OOM behavior and numerical output parity are not measured here.
+
+## Bound clone capacity (personal integration)
+
+`SUMMARY_CLONE_CAPS` may return `SUMMARY_CLONE_CAPS 1 <foreground_context> <physical_cells>`.
+The optional last field is the native window's actual allocation, including explicitly
+reserved clone headroom and alignment. Legacy three-field replies retain the foreground
+limit. Clients validate the reported bounds; they must not infer additional space from an
+environment variable. This does not change the separate 16K fresh-summary bank described
+above or expand normal foreground requests.
+
+Cached clone input and output, and serial disk-preserved emergency continuation, are
+admitted against that physical capacity. Metal KV scratch and the host/device image
+position tables use the same checked capacity calculation. The position tables must not
+remain at the logical foreground size when a clone crosses that boundary. Absolute
+position limits and rollback ownership checks remain enforced. If physical space is also
+exhausted, recovery still retains originals and may use independent extraction. Earlier
+checkpoint cloning is not implemented by this capacity fix.
+
+The personal 64K M1 Max integration was checked with an independent copy of an existing
+64,843-token session: all 64,843 tokens were reported as cached, 3,580 additional input
+tokens were read, and a short validation response completed beyond the logical 65,536-token
+boundary within the reported 73,856 cells. The main owner and original session file were
+preserved. This is a targeted recovery-path check, not a general summary-quality claim.
+
+
+## Earlier-checkpoint recovery (personal Metal opt-in)
+
+`atomic_summary_checkpoint_enabled:true`, native INFO `summary_checkpoint=1`, and
+`STRATA_ATOMIC_SUMMARY_CHECKPOINTS=1` enable earlier-state recovery. The app sends
+an exact source prefix as CPU-only metadata; it never joins the model prompt.
+`SUMMARY_CHECKPOINTS <main_count> <main_hash>` lists only committed checkpoints of
+that exact live prefix. `SUMMARY_STATE_CHECKPOINT <budget> <id> <main_count>
+<main_hash> <checkpoint_count> <checkpoint_hash>` validates both bindings, clones KV
+into the separate bank and restores that checkpoint's recurrent/convolution, PLE
+and indexer state. The private suffix position table starts at that checkpoint's
+next absolute position. The full main count remains the rollback identity.
+
+Only checkpoints covering the entire archived source qualify; no missing image
+rows or partial source gaps are replayed. Expanded image placeholders require the
+completed-history receipt. An unavailable or stale checkpoint retains originals
+and the existing fallback. A checkpoint-selection margin of 4096 output tokens is
+not an output cap: generation uses all actual remaining physical room.
+
+The personal configuration uses existing `--prompt-cache-spread` and
+`--prompt-cache-every 4096` retention. Opt-in SAVE retains up to three exact-prefix
+anchors and admits the peak for all copies before allocation. Other configurations
+still save one checkpoint; the session format is unchanged.
+
+Validation on the personal M1 Max / IQ3_XXS: a synthetic 11,782-token foreground
+session restored three saved checkpoints. Two successive server restarts each
+selected and reused the same 1,255-token checkpoint, completed a short JSON response
+with 11,074 new instruction tokens, and left the original foreground session file
+unchanged during summary. A separate copy of the existing 64,843-token user cache
+also restored, reused all 64,843 tokens, accepted 3,580 new input tokens and released
+the lane successfully. The production manifest and session remained unchanged.
+CPU parser tests passed 95 checks and session-file tests 209 checks. App verification
+passed 8,697 web tests, 525 extension tests and platform Rust suites; the focused
+adapter tests passed 41 tests. These are targeted path/isolation checks, not a claim
+of long-summary quality, GPU numerical parity, OOM stress coverage or non-Metal support.

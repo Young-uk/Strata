@@ -792,18 +792,18 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         lple_ = cc(lib_ple(engine_msl_dir()));
     }
 
-    // Optional physical headroom is reserved for a clone's appended task and
-    // answer. The foreground driver still enforces its original logical context.
+    // Position tables and KV allocations use one checked physical capacity.
+    uint64_t reserve_cells = 0, physical_cells = 0;
     if (const char* reserve = std::getenv("STRATA_ATOMIC_SUMMARY_HEADROOM_TOKENS")) {
-        uint64_t n = 0;
-        const auto parsed = std::from_chars(reserve, reserve + std::strlen(reserve), n);
-        if (parsed.ec != std::errc{} || parsed.ptr != reserve + std::strlen(reserve) ||
-            n > 8192 || max_cells > INT32_MAX - int64_t(n) - 128) {
+        const auto parsed = std::from_chars(reserve, reserve + std::strlen(reserve), reserve_cells);
+        if (parsed.ec != std::errc{} || parsed.ptr != reserve + std::strlen(reserve)) {
             err = "invalid cached-summary physical headroom"; return false;
         }
-        max_cells += int64_t(n);
     }
-    const int MAXC = (int) std::max<int64_t>(4096, (max_cells + 64) / 4 * 4 + 64), MB = MAXC / 4 + 2;
+    if (!strata::core::SummaryStateBank::physical_capacity((uint64_t)max_cells, reserve_cells, physical_cells)) {
+        err = "invalid cached-summary physical capacity"; return false;
+    }
+    const int MAXC = (int)physical_cells, MB = MAXC / 4 + 2;
     max_cells_ = MAXC;
     allocation_max_cells_ = MAXC;
     auto A = [&](size_t bytes) { return cx_->alloc(bytes); };

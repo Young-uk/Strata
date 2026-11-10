@@ -3004,9 +3004,9 @@ class StrataEngine:
 
     def summary_state(self, action, txid=None, *, max_slot_bytes=None, binding=None):
         """Protocol4 only. No path, disk fallback or inferred native support."""
-        if action not in ("caps", "clone_caps", "begin", "fork", "end"):
+        if action not in ("caps", "clone_caps", "checkpoints", "begin", "fork", "end"):
             raise ValueError("invalid state-bank action")
-        if action not in ("caps", "clone_caps") and (not isinstance(txid, str) or re.fullmatch(r"[A-Za-z0-9]{1,64}", txid) is None):
+        if action not in ("caps", "clone_caps", "checkpoints") and (not isinstance(txid, str) or re.fullmatch(r"[A-Za-z0-9]{1,64}", txid) is None):
             raise ValueError("invalid state-bank transaction identity")
         if action in ("begin", "fork") and (type(max_slot_bytes) is not int or not 0 < max_slot_bytes <= 9007199254740991):
             raise ValueError("invalid state-bank budget")
@@ -3014,9 +3014,18 @@ class StrataEngine:
             type(binding.get("tokens")) is not int or not 0 < binding["tokens"] <= self.max_context or
             type(binding.get("hash")) is not int or not 0 <= binding["hash"] < 2**64):
             raise ValueError("invalid clone binding")
+        main = binding.get("main_snapshot", binding) if isinstance(binding, dict) else binding
+        checkpoint = action == "fork" and main is not binding
+        if action == "checkpoints":
+            if not isinstance(binding, dict) or type(binding.get("tokens")) is not int or type(binding.get("hash")) is not int:
+                raise ValueError("invalid checkpoint query binding")
         command = "SUMMARY_CLONE_CAPS" if action == "clone_caps" else "SUMMARY_STATE_" + action.upper()
+        if checkpoint: command = "SUMMARY_STATE_CHECKPOINT"
+        if action == "checkpoints": command = f"SUMMARY_CHECKPOINTS {binding['tokens']} {binding['hash']}"
         if action in ("begin", "fork"): command += f" {max_slot_bytes} {txid}"
-        if action == "fork": command += f" {binding['tokens']} {binding['hash']}"
+        if action == "fork":
+            command += f" {main['tokens']} {main['hash']}"
+            if checkpoint: command += f" {binding['tokens']} {binding['hash']}"
         elif action == "end": command += f" {txid}"
         with self._exclusive_control():
             self.proc.stdin.write(command + "\n")
@@ -3032,9 +3041,24 @@ class StrataEngine:
                 if line.startswith(("INFO ", "WARN ")) and time.monotonic() < deadline:
                     continue
                 fields = line.split()
+                if action == "checkpoints":
+                    if fields[:1] == ["SUMMARY_CHECKPOINTS_REFUSED"]: return []
+                    if (len(fields) < 3 or len(fields) % 2 != 1 or
+                            fields[:3] != ["SUMMARY_CHECKPOINTS", str(binding['tokens']), str(binding['hash'])] or
+                            len(fields) > 131 or any(re.fullmatch(r"[0-9]{1,20}", value) is None for value in fields[3:])):
+                        raise EngineDied("invalid checkpoint query acknowledgment")
+                    return [(int(fields[i]), int(fields[i+1])) for i in range(3, len(fields), 2)]
                 if action == "clone_caps":
-                    if fields != ["SUMMARY_CLONE_CAPS", "1", str(self.max_context)]:
+                    if (len(fields) not in (3, 4) or fields[:3] != ["SUMMARY_CLONE_CAPS", "1", str(self.max_context)]):
                         raise ValueError("engine lacks bound conversation clone protocol")
+                    capacity = self.max_context
+                    if len(fields) == 4:
+                        if re.fullmatch(r"[1-9][0-9]{0,9}", fields[3]) is None:
+                            raise ValueError("invalid native clone capacity")
+                        capacity = int(fields[3])
+                        if not self.max_context <= capacity <= min(4 * self.max_context, 2147483647):
+                            raise ValueError("native clone capacity is outside physical position bounds")
+                    self.summary_clone_context = capacity
                     self.summary_clone_supported = True
                     return True
                 if action == "caps":
@@ -6212,6 +6236,35 @@ class Service:
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
+    def summary_checkpoint_plan(self, sampling, snapshot, task_tokens, cancel):
+        spec = sampling.get("atomic_summary_checkpoint_source")
+        if (not getattr(self.engine, "summary_checkpoint_enabled", False) or not isinstance(spec, dict)
+                or not isinstance(spec.get("messages"), list) or not spec["messages"]):
+            return None
+        messages, source_tools, kwargs = openai_to_messages(spec)
+        require_messages(messages)
+        marked, tools, changed = mark_think_literals(messages, source_tools, self.literals)
+        effort = kwargs.get("reasoning_effort")
+        kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+              if self.effort_end and (kwargs.get("enable_thinking") is False or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+        kw["add_generation_prompt"] = False
+        text = self.template.render(marked, tools=tools, **kw)
+        plain = None
+        if changed: text, plain = unmark_think_literals(text, self.literals)
+        prefix = self.tok.encode(text, parse_special=True, **({"plain": plain} if changed else {}))
+        scheduler = self.summary_lane.scheduler
+        owner = getattr(cancel, "_priority_owner", None)
+        if scheduler is not None and owner is None: return None
+        # The single native stdout stream must never race an ANEXT reader.
+        with scheduler.control(owner) if scheduler is not None else contextlib.nullcontext():
+            if getattr(self.engine, "atomic_main_snapshot", None) is not snapshot: return None
+            candidates = self.engine.summary_state("checkpoints", binding=snapshot)
+        pad = self.tok.encode("<|image_pad|>", parse_special=True)
+        from serve.history_plan import summary_checkpoint
+        return summary_checkpoint(snapshot, sampling["atomic_summary_clone"], prefix, candidates,
+            getattr(self.engine, "summary_clone_context", self.engine.max_context), task_tokens,
+            pad[0] if len(pad) == 1 else None, spec.get("history_hash"))
+
     def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
         """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
         short questions follow.  Three ways to say where it ends: `{"messages": K}` (the first K messages), `{"message":
@@ -6574,7 +6627,14 @@ class Service:
                         # cold-recovery admission path rather than authorize append.
                         snapshot = getattr(self.engine, "atomic_main_snapshot", None)
                         if snapshot and snapshot.get("owner") == sampling["atomic_summary_clone"]:
-                            max_new = self.engine.max_context - snapshot["tokens"] - 1 - len(ids) - CTX_SLACK
+                            capacity = getattr(self.engine, "summary_clone_context", self.engine.max_context)
+                            max_new = capacity - snapshot["tokens"] - 1 - len(ids) - CTX_SLACK
+                            if max_new < 4096:
+                                plan = self.summary_checkpoint_plan(sampling, snapshot, len(ids), cancel)
+                                if plan:
+                                    cancel._atomic_checkpoint_plan = plan
+                                    max_new = capacity - plan["tokens"] - 1 - len(ids) - CTX_SLACK
+                                    print(f"[atomic-summary] checkpoint clone: {plan['tokens']} cached tokens; source {plan['source_tokens']}; full main {snapshot['tokens']}", flush=True)
                             if max_new < 1:
                                 raise atomic_summary.SummaryError("Summary cache has insufficient context headroom; originals retained", 409,
                                     "atomic_summary_headroom_exhausted")
@@ -6593,7 +6653,7 @@ class Service:
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
                     if sampling.get("atomic_summary") is True:
-                        if (par and not cooperative) or thinking or tools or len(ids) + max_new + CTX_SLACK > (self.engine.max_context if sampling.get("atomic_summary_clone") else atomic_summary.CONTEXT):
+                        if (par and not cooperative) or thinking or tools or len(ids) + max_new + CTX_SLACK > (getattr(self.engine, "summary_clone_context", self.engine.max_context) if sampling.get("atomic_summary_clone") else atomic_summary.CONTEXT):
                             raise ValueError("summary requires isolated text-only 16K context and thinking disabled")
                         clone_owner = sampling.get("atomic_summary_clone")
                         cold_owner = sampling.get("atomic_summary_cold_recovery")
@@ -6609,16 +6669,19 @@ class Service:
                             snapshot = getattr(self.engine, "atomic_main_snapshot", None)
                             restored = getattr(self.engine, "atomic_disk_restored_receipt", None)
                             if (not snapshot and restored and restored["owner"] == clone_owner and
-                                    restored["tokens"] + 1 + len(ids) + max_new + CTX_SLACK > self.engine.max_context):
+                                    restored["tokens"] + 1 + len(ids) + max_new + CTX_SLACK > getattr(self.engine, "summary_clone_context", self.engine.max_context)):
                                 raise atomic_summary.SummaryError("Summary cache has insufficient context headroom; originals retained", 409,
                                     "atomic_summary_headroom_exhausted")
                             if not getattr(self.summary_lane, "clone_enabled", False) or not snapshot or snapshot["owner"] != clone_owner:
                                 raise atomic_summary.SummaryError("The requested foreground cache is no longer current; originals retained", 409,
                                     "atomic_summary_clone_stale")
-                            if snapshot["tokens"] + 1 + len(ids) + max_new + CTX_SLACK > self.engine.max_context:
+                            plan = getattr(cancel, "_atomic_checkpoint_plan", None)
+                            if plan and plan.get("main_snapshot") is not snapshot:
+                                raise atomic_summary.SummaryError("Checkpoint owner changed; originals retained", 409, "atomic_summary_clone_stale")
+                            if (plan or snapshot)["tokens"] + 1 + len(ids) + max_new + CTX_SLACK > getattr(self.engine, "summary_clone_context", self.engine.max_context):
                                 raise atomic_summary.SummaryError("Summary cache has insufficient context headroom; originals retained", 409,
                                     "atomic_summary_headroom_exhausted")
-                            cancel._atomic_clone_snapshot = dict(snapshot)
+                            cancel._atomic_clone_snapshot = dict(plan or snapshot)
                         try:
                             turn.enter_context(self.summary_lane.transaction(self.engine, cancel))
                         except BaseException as exc:
@@ -8426,6 +8489,7 @@ def make_handler(svc: Service):
                                      "atomic_summary_slot": svc.summary_lane.enabled and not svc.summary_lane.poisoned,
                                      "atomic_summary_context": atomic_summary.CONTEXT,
                                      "atomic_summary_clone": bool(getattr(svc.summary_lane, "clone_enabled", False)),
+                                     "atomic_summary_clone_context": getattr(svc.engine, "summary_clone_context", None),
                                      "atomic_summary_protocol": 5 if svc.summary_lane.scheduler else 4 if svc.summary_lane.mode == "state-bank-v1" else 3,
                                      "atomic_summary_scheduler": svc.summary_lane.scheduler.status() if svc.summary_lane.scheduler else None,
                                      "atomic_summary_continuation_text_only": False if svc.summary_lane.scheduler else None,
@@ -10856,6 +10920,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             try:
                 svc.engine.summary_state("clone_caps")
                 svc.summary_lane.clone_enabled = True
+                svc.engine.summary_checkpoint_enabled = (cfg.get("atomic_summary_checkpoint_enabled") is True
+                    and svc.engine.info.get("summary_checkpoint") == 1)
             except Exception:
                 svc.summary_lane.clone_enabled = False
                 print("[strata] cached conversation summaries unavailable; legacy summaries retained", flush=True)

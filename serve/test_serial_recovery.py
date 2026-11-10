@@ -49,6 +49,19 @@ class Recovery(unittest.TestCase):
         self.assertIsNone(self.scheduler.exclusive_owner)
         self.assertFalse(self.lane.poisoned)
 
+    def test_checkpoint_clone_disk_rollback_protects_the_full_main(self):
+        main = {**self.cancel._atomic_clone_snapshot, 'owner': 'room/turn', 'hash': 99}
+        self.engine.atomic_main_snapshot = main
+        self.cancel._atomic_clone_snapshot = {'ids': [1], 'tokens': 1, 'tail': 2,
+            'owner': 'room/turn', 'hash': 7, 'main_snapshot': main}
+        with self.lane.serial_recovery(self.engine, self.cancel):
+            self.assertEqual(self.cancel._atomic_serial_recovery['tokens'], 3)
+            self.assertEqual(self.cancel._atomic_serial_recovery['ids'], [1, 2, 3])
+            self.engine.main = 'summary'
+        self.assertEqual(self.engine.main, 'original')
+        self.assertEqual(self.engine.calls, ['save', 'restore'])
+        self.assertIs(self.engine.atomic_main_snapshot, main)
+
     def test_cold_emergency_saves_and_restores_without_allocating_a_bank(self):
         self.lane.mode = 'state-bank-v1'
         self.lane.disk_recovery_enabled = True

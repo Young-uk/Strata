@@ -12,6 +12,20 @@ class CachedSummaryTests(unittest.TestCase):
         self.assertEqual(engine.proc.sent, ['SUMMARY_CLONE_CAPS\n'])
         self.assertTrue(engine.summary_clone_supported)
 
+    def test_clone_capacity_is_reported_by_native_not_inferred_from_config(self):
+        engine = ProtocolTests().engine(['SUMMARY_CLONE_CAPS 1 65536 73856\n'])
+        self.assertTrue(engine.summary_state('clone_caps'))
+        self.assertEqual(engine.max_context, 65536)
+        self.assertEqual(engine.summary_clone_context, 73856)
+        legacy = ProtocolTests().engine(['SUMMARY_CLONE_CAPS 1 65536\n'])
+        legacy.summary_clone_context = 73856
+        self.assertTrue(legacy.summary_state('clone_caps'))
+        self.assertEqual(legacy.summary_clone_context, 65536)
+        for capacity in ('65535', '-1', '073856', '2147483648', '262145', 'nan'):
+            engine = ProtocolTests().engine([f'SUMMARY_CLONE_CAPS 1 65536 {capacity}\n'])
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                engine.summary_state('clone_caps')
+
     def test_bound_clone_wire_and_no_disk_fallback(self):
         engine = ProtocolTests().engine(['SUMMARY_STATE_HELD clone1 53000 1055000000 1\n'])
         binding = {'tokens': 53000, 'hash': 18446744073709551615}

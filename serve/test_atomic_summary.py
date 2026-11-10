@@ -526,6 +526,35 @@ class Api(unittest.TestCase):
         self.assertGreater(self.svc.status["max_tokens"], 2048)
         self.assertLess(self.svc.status["max_tokens"], self.engine.max_context - 60000)
 
+    def test_recovery_clone_can_use_native_physical_headroom_at_full_logical_context(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.summary_clone_context = 73856
+        self.engine.atomic_main_snapshot = {"owner": "thread/turn", "tokens": 64843, "hash": 19, "tail": 2}
+        self.engine.script = self.tok.encode('abcdef' * 500) + self.tok.encode('<|im_end|>', parse_special=True)
+        status, result = self.call("/v1/chat/completions", {**BODY, "max_tokens": 0,
+            "atomic_summary_clone": "thread/turn", "atomic_summary_recovery": True})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+        self.assertGreater(self.svc.status["max_tokens"], 8192)
+        self.assertLess(self.svc.status["max_tokens"], 73856 - 64843)
+        self.assertEqual(self.engine.max_context, 65536)
+        self.assertEqual(self.engine.main, "original")
+        self.assertFalse(self.svc.summary_lane.poisoned)
+
+    def test_physical_clone_headroom_does_not_remove_the_allocation_bound(self):
+        self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
+        self.svc.summary_lane.clone_enabled = True
+        self.engine.summary_clone_context = 73856
+        self.engine.atomic_main_snapshot = {"owner": "thread/turn", "tokens": 64843, "hash": 19, "tail": 2}
+        status, result = self.call("/v1/chat/completions", {**BODY, "max_tokens": 0,
+            "messages": [{"role": "user", "content": "x" * 10000}],
+            "atomic_summary_clone": "thread/turn", "atomic_summary_recovery": True})
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["error"]["code"], "atomic_summary_headroom_exhausted")
+        self.assertNotIn("generate", self.engine.calls)
+        self.assertEqual(self.engine.main, "original")
+
     def test_cached_auto_output_refuses_only_when_no_physical_room_remains(self):
         self.svc.summary_lane.configure(self.engine, self.tmp.name, ENVELOPE)
         self.svc.summary_lane.clone_enabled = True

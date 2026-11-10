@@ -1162,11 +1162,35 @@ uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const Se
 
 bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, const SessionSaveLive& live,
                               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
-                              std::vector<ConversationCheckpoint>& out, std::string& why) {
+                              std::vector<ConversationCheckpoint>& out, std::string& why, size_t max_checkpoints) {
     out.clear();
     const ConversationCheckpoint* deepest = session_deepest_checkpoint(chain);
-    if (admit && !admit(session_save_peak_bytes(deepest, live), why)) return false;
-    if (deepest) out.push_back(*deepest);
+    std::vector<const ConversationCheckpoint*> selected;
+    if (deepest) selected.push_back(deepest);
+    // Opt-in recovery anchors: keep the oldest usable prefix and the nearest
+    // middle prefix. Never save unrelated branches or pass a pinned boundary.
+    if (deepest && max_checkpoints > 1) {
+        const ConversationCheckpoint* first = nullptr;
+        for (const auto& c : chain)
+            if (!c.ids.empty() && c.ids.size() < deepest->ids.size() && c.stage_parts.empty() &&
+                std::equal(c.ids.begin(), c.ids.end(), deepest->ids.begin()) &&
+                (!first || c.ids.size() < first->ids.size())) first = &c;
+        if (first) selected.push_back(first);
+        if (first && max_checkpoints > 2) {
+            const ConversationCheckpoint* middle = nullptr;
+            const size_t target = first->ids.size() + (deepest->ids.size() - first->ids.size()) / 2;
+            auto distance = [&](size_t n) { return n > target ? n - target : target - n; };
+            for (const auto& c : chain)
+                if (c.ids.size() > first->ids.size() && c.ids.size() < deepest->ids.size() && c.stage_parts.empty() &&
+                    std::equal(c.ids.begin(), c.ids.end(), deepest->ids.begin()) &&
+                    (!middle || distance(c.ids.size()) < distance(middle->ids.size()))) middle = &c;
+            if (middle) selected.push_back(middle);
+        }
+    }
+    uint64_t peak = session_save_peak_bytes(deepest, live);
+    for (size_t i = 1; i < selected.size(); ++i) peak = sat_add(peak, sat_mul(2, selected[i]->bytes()));
+    if (admit && !admit(peak, why)) return false;
+    for (const auto* c : selected) out.push_back(*c);
     return true;
 }
 

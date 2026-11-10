@@ -9,7 +9,7 @@ namespace strata::core {
 // Experimental protocol 4. Separate command names forbid accidental protocol-3 disk fallback.
 struct SummaryStateBank {
     std::string id;
-    uint64_t epoch = 0, main_tokens = 0, allocated_bytes = 0, context = 16384;
+    uint64_t epoch = 0, main_tokens = 0, allocated_bytes = 0, context = 16384, clone_tokens = 0;
     static bool warmup_ready(bool streaming, bool arena_ready, bool gemm_enabled,
                              bool prompt_windows, bool gemm_ready, int prompt_capacity, int chunk) noexcept {
         return streaming ? arena_ready && (prompt_windows || !gemm_enabled || gemm_ready)
@@ -47,9 +47,28 @@ struct SummaryStateBank {
         };
         return number(n, tokens) && tokens > 0 && number(h, hash);
     }
-    static bool clone_room(uint64_t next, uint64_t input, uint64_t output, uint64_t context) noexcept {
+    static bool parse_checkpoint(const std::string& args, uint64_t& budget, std::string& id,
+                                 uint64_t& tokens, uint64_t& hash, uint64_t& prefix, uint64_t& prefix_hash) {
+        std::istringstream in(args);
+        std::string b, name, n, h, p, ph, extra;
+        if (!(in >> b >> name >> n >> h >> p >> ph) || (in >> extra) ||
+            !parse_fork(b + " " + name + " " + n + " " + h, budget, id, tokens, hash)) return false;
+        uint64_t ignored = 0; std::string ignored_id;
+        return parse_fork("1 Prefix " + p + " " + ph, ignored, ignored_id, prefix, prefix_hash)
+            && prefix < tokens;
+    }
+    static bool physical_capacity(uint64_t logical, uint64_t reserve, uint64_t& cells) noexcept {
+        if (reserve > 8192 || logical > uint64_t(INT32_MAX) - reserve - 128) return false;
+        const uint64_t rounded = (logical + reserve + 64) / 4 * 4 + 64;
+        cells = rounded < 4096 ? 4096 : rounded;
+        return true;
+    }
+    static bool clone_room(uint64_t next, uint64_t input, uint64_t output, uint64_t context,
+                           uint64_t physical_context = 0) noexcept {
         // Reused absolute positions have bounded headroom even after compaction.
-        return context > 0 && context <= INT32_MAX && input <= context && output <= context &&
+        const uint64_t capacity = physical_context ? physical_context : context;
+        return context > 0 && context <= INT32_MAX && capacity >= context &&
+               capacity <= INT32_MAX && capacity <= 4 * context && input <= capacity && output <= capacity &&
                next < 4 * context && input + output + 8 < 4 * context - next;
     }
     bool active() const noexcept { return !id.empty(); }

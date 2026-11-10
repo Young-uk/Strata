@@ -693,6 +693,19 @@ int main() {
         const auto agree = [&](uint64_t, std::string&) { return true; };
         check(session_save_checkpoints(chain, live, agree, out, why) && out.size() == 1 &&
               same_checkpoint(out[0], chain[1]), "save: admitted, the deepest checkpoint is copied");
+        auto anchors = chain;
+        anchors[0].ids.assign(10, 7); anchors[1].ids.assign(700, 7);
+        anchors.push_back(checkpoint(350, 3)); anchors.back().ids.assign(350, 7);
+        const uint64_t multi_peak = session_save_peak_bytes(&anchors[1], live) +
+            2 * anchors[0].bytes() + 2 * anchors[2].bytes();
+        check(!session_save_checkpoints(anchors, live, refuse, out, why, 3) && asked == multi_peak && out.empty(),
+              "save: all recovery anchors admitted before copying");
+        check(session_save_checkpoints(anchors, live, agree, out, why, 3) && out.size() == 3 &&
+              out[0].ids.size() == 700 && out[1].ids.size() == 10 && out[2].ids.size() == 350,
+              "save: opted-in deepest, oldest and middle prefix states survive");
+        anchors[0].ids[0] = 8;
+        check(session_save_checkpoints(anchors, live, agree, out, why, 3) && out.size() == 2,
+              "save: unrelated checkpoint is excluded");
         check(session_save_checkpoints({}, live, agree, out, why) && out.empty(), "save: no checkpoints, none copied");
 #if defined(__linux__) && !defined(__SANITIZE_ADDRESS__) && !defined(STRATA_NO_RLIMIT_TEST)
         // under a real address-space limit that cannot hold one more copy: the refusal comes first, no bad_alloc;

@@ -6,6 +6,17 @@ int main() {
     using strata::core::SummaryStateBank;
     unsigned checks = 0;
     auto check = [&](bool x) { ++checks; assert(x); };
+    uint64_t cells = 0;
+    check(SummaryStateBank::physical_capacity(65536, 8192, cells) && cells == 73856);
+    check(SummaryStateBank::physical_capacity(65536, 0, cells) && cells == 65664);
+    check(SummaryStateBank::physical_capacity(16384, 8192, cells) && cells == 24704);
+    check(!SummaryStateBank::physical_capacity(65536, 8193, cells));
+    check(!SummaryStateBank::physical_capacity(INT32_MAX, 0, cells));
+    check(SummaryStateBank::clone_room(1000, 10, 70000, 65536, 73856));
+    check(!SummaryStateBank::clone_room(1000, 10, 70000, 65536));
+    check(!SummaryStateBank::clone_room(1000, 10, 70000, 65536, 65535));
+    check(!SummaryStateBank::clone_room(1000, 10, 74000, 65536, 73856));
+    check(!SummaryStateBank::clone_room(262140, 1, 1, 65536, 73856));
     uint64_t budget = 0; std::string id;
     check(SummaryStateBank::parse_begin("1073741824 Ab019", budget, id));
     check(budget == 1073741824 && id == "Ab019");
@@ -56,6 +67,11 @@ int main() {
     check(!SummaryStateBank::clone_room(262000, 1000, 2048, 65536));
     check(!SummaryStateBank::clone_room(262144, 1, 1, 65536));
     check(!SummaryStateBank::clone_room(0, UINT64_MAX, 2048, 65536));
+    uint64_t prefix = 0, prefix_hash = 0;
+    check(SummaryStateBank::parse_checkpoint("2000000000 Fork1 60000 99 40000 88", budget, id, count, hash, prefix, prefix_hash));
+    check(count == 60000 && hash == 99 && prefix == 40000 && prefix_hash == 88);
+    for (const std::string args : {"1 Job 10 1 10 1", "1 Job 10 1 11 1", "1 Job 10 1 0 1", "1 Job 10 1 5 -1", "1 Job 10 1 5 1 extra"})
+        check(!SummaryStateBank::parse_checkpoint(args, budget, id, count, hash, prefix, prefix_hash));
     SummaryStateBank tx;
     check(!tx.active()); check(tx.allows("SAVE original"));
     tx.id = "Job1"; tx.epoch = 1; tx.main_tokens = 65536; tx.allocated_bytes = 400000000;
