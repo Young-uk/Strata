@@ -46,7 +46,9 @@ def request(req, *, count=False):
         raise ValueError("atomic_background_task must be a boolean")
     if "atomic_summary_recovery" in req and type(req["atomic_summary_recovery"]) is not bool:
         raise ValueError("atomic_summary_recovery must be a boolean")
-    if req.get("tools") or req.get("strata_mcp") or req.get("response_format"):
+    if "atomic_auxiliary" in req and type(req["atomic_auxiliary"]) is not bool:
+        raise ValueError("atomic_auxiliary must be a boolean")
+    if req.get("tools") or req.get("strata_mcp") or (req.get("response_format") and req.get("atomic_auxiliary") is not True):
         raise ValueError("summary requests are text-only, without tools or response_format")
     messages = req.get("messages")
     if not isinstance(messages, list) or not messages:

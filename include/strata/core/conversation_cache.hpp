@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -262,6 +263,9 @@ public:
     /// with one long conversation spends the cache on the side requests and evicts the long one (oldest first) -
     /// exactly the reuse it wanted.  0 parks every conversation, whatever its size.
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
+    // Optional spill before an LRU eviction. A failed spill remains a cache miss.
+    std::function<void(const SavedConversation&)> before_evict;
+    std::function<void()> after_clear;
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
@@ -434,6 +438,7 @@ public:
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            if (before_evict) before_evict(entries_[i]);
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
@@ -445,6 +450,7 @@ public:
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
     size_t clear() {
+        if (after_clear) after_clear();
         const size_t n = entries_.size();
         entries_.clear();
         serials_.clear();
