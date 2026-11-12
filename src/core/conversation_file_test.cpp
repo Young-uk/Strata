@@ -269,6 +269,30 @@ int main() {
     // other model or other configuration
     check(rejects(good, {id.model ^ 1, id.config}, "model"), "different model fingerprint rejected");
     check(rejects(good, {id.model, id.config ^ 1}, "config"), "different configuration rejected");
+    // Visual approximate history uses explicit v3 and preserves every axis.
+    {
+        auto visual=original;
+        visual.live.imgs={{100,12345}};
+        std::fill(visual.live.ids.begin()+100,visual.live.ids.begin()+104,42);
+        visual.history_positions.clear();
+        for(size_t j=0;j<=visual.live.ids.size();j++) {
+            const int32_t t=int32_t(j<100?j+100:j<104?200:j+98);
+            visual.history_positions.push_back(t);
+            visual.history_positions.push_back(t+(j>=100&&j<104?int32_t((j-100)/2):0));
+            visual.history_positions.push_back(t+(j>=100&&j<104?int32_t((j-100)%2):0));
+        }
+        const auto path=dir/"history-v3.bin";
+        check(session_file_write(path.string(),visual,id,written,error),"visual v3 write");
+        check(uint8_t(slurp(path)[8])==3,"visual v3 explicit version");
+        SavedConversation back;size_t n=0;
+        check(session_file_read(path.string(),id,back,n,error),"visual v3 read");
+        check(back.history_positions==visual.history_positions && back.live.imgs==visual.live.imgs,"visual axes and ownership round trip");
+        auto bad=visual;bad.history_positions[102*3+2]++;
+        check(!session_file_write((dir/"bad-grid.bin").string(),bad,id,n,error),"malformed visual grid refused");
+        bad=visual;bad.live.imgs.clear();
+        check(!session_file_write((dir/"unowned-grid.bin").string(),bad,id,n,error),"unowned visual axes refused");
+        error.clear();
+    }
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;

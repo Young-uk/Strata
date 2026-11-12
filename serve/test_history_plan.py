@@ -18,6 +18,17 @@ class Plans(unittest.TestCase):
             result=choose_boundary(self.snapshot,'thread/user',[{'boundary':125,'source':source},{'boundary':123,'source':768}],lambda c:self.incoming(c['source']),99,65536)
             self.assertEqual(result['boundary'],123)
             self.assertEqual(result['source_tokens'],768)
+    def test_retained_image_is_fresh_and_planner_matches_native_text_only_window(self):
+        self.old[1301:1305]=[42]*4
+        result=choose_boundary(self.snapshot,'thread/user',[{'boundary':22,'source':768}],lambda c:self.incoming(c['source']),99,131072,42)
+        self.assertEqual(result['retained_tokens'],532)
+        self.assertNotIn(42,self.old[result['source_tokens']:result['source_tokens']+result['retained_tokens']])
+        self.old[800:804]=[42]*4
+        result=choose_boundary(self.snapshot,'thread/user',[{'boundary':22,'source':768}],lambda c:self.incoming(c['source']),99,131072,42)
+        self.assertEqual(result['reason'],'no-budgeted-aligned-turn')
+    def test_image_in_fixed_prefix_prevents_text_only_relocation(self):
+        self.old[20]=42
+        self.assertIsNone(retained_match(self.old,self.incoming(768),99,42))
     def test_prefers_nominal_boundary_when_already_aligned(self):
         result=choose_boundary(self.snapshot,'thread/user',[{'boundary':125,'source':768},{'boundary':123,'source':768}],lambda c:self.incoming(c['source']),99,65536)
         self.assertEqual(result['boundary'],125)
@@ -32,7 +43,7 @@ class Plans(unittest.TestCase):
         ids=[1,2,3,101];binding={'tokens':len(ids),'hash':token_hash(ids)}
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'saved.session'
-            for version in (1,2):
+            for version in (1,2,3):
                 header=b'FORMAT00'+struct.pack('<II',version,64)+bytes(48)
                 path.write_bytes(header+bytes(18*8+3*8)+struct.pack('<Q',len(ids))+struct.pack('<4i',*ids))
                 self.assertEqual(restored_ids(path,binding),ids)

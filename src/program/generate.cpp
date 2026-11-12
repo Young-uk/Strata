@@ -16585,8 +16585,10 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         if (history_approximate) {
-                            meta.history_positions.reserve(live.size()+1);
-                            for (size_t j = 0; j <= live.size(); ++j) meta.history_positions.push_back(mrope_host[j*3]);
+                            const size_t axes = live_imgs.empty() ? 1 : 3;
+                            meta.history_positions.reserve((live.size()+1)*axes);
+                            for (size_t j = 0; j <= live.size(); ++j)
+                                for(size_t k=0;k<axes;k++) meta.history_positions.push_back(mrope_host[j*3+k]);
                         }
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
@@ -16658,7 +16660,7 @@ int main(int argc, char** argv) {
 #if !defined(STRATA_GPU_METAL)
                     if (!image.history_positions.empty()) { refuse("approximate history requires Metal"); continue; }
 #endif
-                    if (!strata::history::positions_valid(image.history_positions, image.live.ids.size(), 4*o.max_context) ||
+                    if (!strata::history::position_map_valid(image.history_positions, image.live.ids, image.live.imgs, 4*o.max_context) ||
                         (!image.history_positions.empty() && (!o.vision || use_mtp || use_df2 || o.batch || !stages.empty()))) {
                         refuse("unsupported approximate history position map"); continue;
                     }
@@ -16685,9 +16687,11 @@ int main(int argc, char** argv) {
                     history_approximate = !image.history_positions.empty();
                     if (history_approximate) {
                         for (size_t j = 0; j < mrope_host.size()/3; ++j) {
-                            const int64_t p = j < image.live.ids.size() ? image.history_positions[j]
-                                : int64_t(image.history_positions.back()) + int64_t(j-image.live.ids.size());
-                            for (size_t k = 0; k < 3; ++k) mrope_host[j*3+k] = int32_t(p);
+                            const bool visual = !image.live.imgs.empty();
+                            const int64_t frontier = image.history_positions[image.live.ids.size()*(visual?3:1)];
+                            for(size_t k=0;k<3;k++) mrope_host[j*3+k] = j<=image.live.ids.size()
+                                ? image.history_positions[j*(visual?3:1)+(visual?k:0)]
+                                : int32_t(frontier+int64_t(j-image.live.ids.size()));
                         }
                         if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                             std::printf("FATAL restoring history positions failed\n"); std::fflush(stdout); return 1;
@@ -16900,8 +16904,15 @@ int main(int argc, char** argv) {
             // A text handoff may remove all old image turns. Keep the original
             // position map until that transition is proven; normal fallback
             // below may still reset the active text map and reread the prompt.
+            // Removing an image without a new historical handoff changes the
+            // visual grid. No proof exists for translating that edited tail.
+            if (history_approximate && !geni && !live_imgs.empty() &&
+                (!req_history || req_history == history_last_hash)) {
+                live_ok = false; checks.clear(); history_approximate = false;
+            }
             std::vector<int32_t> history_image_positions;
-            if (req_history && req_history != history_last_hash && !geni && live_ok && !live_imgs.empty())
+            if (live_ok && ((geni && history_approximate) ||
+                (req_history && req_history != history_last_hash && (geni || !live_imgs.empty()))))
                 history_image_positions = mrope_host;
             if (geni || (!mrope_identity && !history_approximate)) {
                 // positions for every cell this request can reach; the identity again for a text request
@@ -16995,6 +17006,9 @@ int main(int argc, char** argv) {
                 }
                 mrope_identity = !geni;
             }
+            const auto history_incoming_positions = geni && !history_image_positions.empty()
+                ? mrope_host : std::vector<int32_t>{};
+            bool history_positions_ready = false;
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
             if (n + max_new + 8 > o.max_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
@@ -17148,25 +17162,28 @@ int main(int argc, char** argv) {
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
 #if defined(STRATA_GPU_METAL)
-            if (req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && !geni && live_ok && !nan_flush &&
+            if (req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && live_ok && !nan_flush &&
                 stages.empty() && o.batch == 0 && !use_mtp && !use_df2 && o.vision &&
                 want_cvec == cvec_cached && o.prompt_cache > 0 && !starts_with(live, live_imgs)) {
-                const auto plan = strata::history::match(live, ids, int32_t(o.turn_token));
+                const auto plan = strata::history::match(live, ids, int32_t(o.turn_token), kImagePad);
                 if (plan.length && strata::history::images_discarded(live, live_imgs, plan, kImagePad)) {
                     const int64_t end = int64_t(plan.source + plan.length);
                     const auto& original_positions = history_image_positions.empty() ? mrope_host : history_image_positions;
                     const bool mapped = history_approximate || !history_image_positions.empty();
                     const int64_t next_pos = mapped ? original_positions[size_t(end) * 3] : end;
                     const int64_t needed = next_pos + n - int64_t(plan.prefix + plan.length) + history_output_reserve + 8;
-                    if (needed < 4 * o.max_context) {
+                    std::vector<int32_t> image_positions;
+                    const bool positions_ok = !geni || strata::history::compose_positions(
+                        original_positions, mrope_host, plan.prefix, plan.source, plan.length, image_positions);
+                    if (positions_ok && needed < 4 * o.max_context) {
                         // Allocate and validate all host metadata before any authoritative device write.
                         auto compacted = std::vector<int32_t>(ids.begin(), ids.begin() + plan.prefix + plan.length);
-                        auto positions = original_positions;
-                        for (size_t j = 0; j < plan.length; ++j)
+                        auto positions = geni ? std::move(image_positions) : original_positions;
+                        for (size_t j = 0; !geni && j < plan.length; ++j)
                             for (size_t k = 0; k < 3; ++k)
                                 positions[(plan.prefix+j)*3+k] = mapped
                                     ? original_positions[(plan.source+j)*3+k] : int32_t(plan.source+j);
-                        for (size_t j = plan.prefix + plan.length; j < positions.size()/3; ++j)
+                        for (size_t j = plan.prefix + plan.length; !geni && j < positions.size()/3; ++j)
                             for (size_t k = 0; k < 3; ++k)
                                 positions[j*3+k] = int32_t(next_pos + int64_t(j-plan.prefix-plan.length));
                         if (!ver.wait_commit(err) || cudaDeviceSynchronize() != cudaSuccess ||
@@ -17180,6 +17197,7 @@ int main(int argc, char** argv) {
                         }
                         checks.clear(); conversations.clear(); conversations.take_reuse();
                         tail_ckpt_len = -1; history_approximate = true; mrope_identity = false;
+                        history_positions_ready = geni;
                         std::fprintf(stderr, "strata history-cache: approximate=1 prefix=%zu retained=%zu source=%zu\n",
                                      plan.prefix, plan.length, plan.source);
                     } else std::fprintf(stderr, "strata history-cache: fallback=position-headroom\n");
@@ -17701,7 +17719,34 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            if (history_approximate && (geni || resume == 0 || replaced_history_map)) {
+            // A later GENI request rebuilds canonical image positions before
+            // cache selection. Preserve the live cache's absolute positions,
+            // translating only its freshly evaluated tail (including images).
+            if (history_approximate && geni && !history_positions_ready && from_live &&
+                resume > 0 && !replaced_history_map && !history_image_positions.empty()) {
+                std::vector<int32_t> positions;
+                if (strata::history::compose_positions(history_image_positions, mrope_host,
+                        0, 0, size_t(resume), positions) &&
+                    int64_t(positions[size_t(n-1)*3]) + history_output_reserve + 8 < 4*o.max_context) {
+                    mrope_host.swap(positions);
+                    if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        std::printf("FATAL continuing image history positions failed\n"); std::fflush(stdout); return 1;
+                    }
+                    history_positions_ready = true;
+                }
+            }
+            if (history_approximate && geni && (!history_positions_ready || !from_live || replaced_history_map)) {
+                // Unproven image provenance must fall back to a complete fresh
+                // request, never reuse K/V with different rotary positions.
+                resume = 0; from_live = false; live_ok = false; checks.clear();
+                if (!history_incoming_positions.empty()) {
+                    mrope_host = history_incoming_positions;
+                    if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        std::printf("FATAL resetting image history positions failed\n"); std::fflush(stdout); return 1;
+                    }
+                }
+            }
+            if (history_approximate && ((geni && !history_positions_ready) || resume == 0 || replaced_history_map)) {
                 history_approximate = false;
                 if (!geni) {
                     for (size_t c = 0; c < mrope_host.size()/3; ++c)

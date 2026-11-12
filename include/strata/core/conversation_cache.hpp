@@ -186,7 +186,7 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
-    // Text-only approximate history: absolute RoPE position per live cell, then the next frontier.
+    // Approximate history: one absolute axis for text (v2), three axes with images (v3), including the next frontier.
     // Empty is the unchanged format-v1 identity path. The caller mounts this table before inference.
     std::vector<int32_t> history_positions;
     // with a layer split, the later stages' own images, one per stage, in stage order

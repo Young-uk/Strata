@@ -8707,8 +8707,9 @@ def make_handler(svc: Service):
                     turn = svc.tok.encode("<|im_start|>", parse_special=True)
                     if len(turn) != 1:
                         raise ValueError("history planning requires a single-token turn boundary")
+                    image = svc.tok.encode("<|image_pad|>", parse_special=True)
                     result = choose_boundary(snapshot, req.get("owner"), req.get("candidates"),
-                        encode_candidate, turn[0], svc.reported_ctx())
+                        encode_candidate, turn[0], svc.reported_ctx(), image[0] if len(image) == 1 else None)
                     if getattr(svc.engine, "atomic_main_snapshot", None) is not snapshot:
                         result = {"boundary": None, "reason": "cache-changed"}
                     self._json(200, result)

@@ -690,8 +690,8 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    if (!strata::history::positions_valid(image.history_positions, image.live.ids.size()) ||
-        (!image.history_positions.empty() && (!image.live.imgs.empty() || !image.stage_images.empty() || draft)))
+    if (!strata::history::position_map_valid(image.history_positions, image.live.ids, image.live.imgs) ||
+        (!image.history_positions.empty() && (!image.stage_images.empty() || draft)))
         return fail(error, "invalid approximate history position metadata");
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");

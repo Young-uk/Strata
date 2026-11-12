@@ -28,6 +28,50 @@ int main() {
    std::vector<int32_t> b(a.begin(),a.begin()+65);b.insert(b.end(),a.begin()+769,a.begin()+1537);b.push_back(55);
    auto q=match(a,b,turn);assert(q.prefix==68&&q.source==772&&q.length==764);
  }
+ {
+   auto visual_old=old;
+   std::fill(visual_old.begin()+1301,visual_old.begin()+1305,42);
+   std::vector<int32_t> visual_next(visual_old.begin(),visual_old.begin()+64);
+   visual_next.insert(visual_next.end(),visual_old.begin()+768,visual_old.begin()+1800);
+   visual_next.push_back(20);
+   auto q=match(visual_old,visual_next,turn,42);
+   assert(q.prefix==64&&q.source==768&&q.length==532);
+   assert(images_discarded(visual_old,std::vector<Image>{{1301}},q,42));
+   assert(visual_next[q.prefix+q.length]!=42); // reread whole pooled block before image
+   visual_old[20]=visual_next[20]=42;
+   assert(!match(visual_old,visual_next,turn,42).length);
+ }
+ {
+   std::vector<int32_t> old_map(6000),fresh(6000),out;
+   for(size_t j=0;j<2000;j++)for(size_t k=0;k<3;k++)old_map[j*3+k]=fresh[j*3+k]=int32_t(j);
+   fresh[600*3+1]=607;fresh[600*3+2]=611;
+   assert(compose_positions(old_map,fresh,64,768,532,out));
+   assert(out[64*3]==768&&out[595*3]==1299);
+   assert(out[600*3]==1304&&out[600*3+1]==1311&&out[600*3+2]==1315);
+   // A later image-bearing continuation preserves ALL committed positions.
+   std::vector<int32_t> continued;
+   assert(compose_positions(out,fresh,0,0,900,continued));
+   assert(std::equal(continued.begin(),continued.begin()+2700,out.begin()));
+   const auto saved=continued;
+   assert(!compose_positions(out,fresh,0,0,2000,continued));assert(continued==saved);
+   old_map[1299*3]=INT32_MAX;
+   assert(!compose_positions(old_map,fresh,64,768,531,continued));assert(continued==saved);
+ }
+ {
+   std::vector<int32_t> ids{10,11,42,42,42,42,12,13};
+   std::vector<int32_t> visual{0,0,0,1,1,1,20,20,20,20,20,21,20,21,20,20,21,21,22,22,22,23,23,23,24,24,24};
+   const std::vector<Image> owner{{2}};
+   assert(position_map_valid(visual,ids,owner,32));
+   assert(!position_map_valid(visual,ids,std::vector<Image>{},32));
+   assert(!position_map_valid(visual,ids,std::vector<Image>{{-1}},32));
+   assert(!position_map_valid(visual,ids,owner,21));
+   auto malformed=visual;malformed[4*3+2]=21;
+   assert(!position_map_valid(malformed,ids,owner,32));
+   malformed=visual;malformed.back()=25;
+   assert(!position_map_valid(malformed,ids,owner,32));
+   malformed=visual;malformed.pop_back();
+   assert(!position_map_valid(malformed,ids,owner,32));
+ }
  auto wrong=next;wrong[0]=-1;assert(!match(old,wrong,turn).length);
  auto short_run=next;short_run.resize(100);assert(!match(old,short_run,turn).length);
  auto exact=old;exact.push_back(1);assert(!match(old,exact,turn).length);

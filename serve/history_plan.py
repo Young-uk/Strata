@@ -22,7 +22,7 @@ def restored_ids(path, binding):
         return None
     with open(path, 'rb') as source:
         header = source.read(64)
-        if len(header) != 64 or struct.unpack_from('<II', header, 8) not in ((1, 64), (2, 64)):
+        if len(header) != 64 or struct.unpack_from('<II', header, 8) not in ((1, 64), (2, 64), (3, 64)):
             return None
         source.seek(64 + 18 * 8 + 3 * 8)
         size = source.read(8)
@@ -35,7 +35,7 @@ def restored_ids(path, binding):
     return ids if all(token >= 0 for token in ids) and token_hash(ids) == binding['hash'] else None
 
 
-def retained_match(old, new, turn):
+def retained_match(old, new, turn, image_pad=None):
     """Mirror include/history_cache.hpp without touching authoritative state."""
     common = 0
     while common < min(len(old), len(new)) and old[common] == new[common]:
@@ -49,6 +49,8 @@ def retained_match(old, new, turn):
     prefix = (prefix + 3) // 4 * 4
     if prefix > common or len(new) - prefix <= 512:
         return None
+    if image_pad is not None and image_pad in old[:prefix]:
+        return None
     offset, best = prefix - turn_boundary, None
     for source in range(prefix + 4, len(old) - 511, 4):
         if old[source - offset] != turn or old[source:source + 32] != new[prefix:prefix + 32]:
@@ -56,13 +58,18 @@ def retained_match(old, new, turn):
         length = 32
         while source + length < len(old) and prefix + length < len(new) and old[source + length] == new[prefix + length]:
             length += 1
+        if image_pad is not None:
+            try:
+                length = old.index(image_pad, source, source + length) - source
+            except ValueError:
+                pass
         length = min(length, len(new) - prefix - 1) // 4 * 4
         if length >= 512 and (best is None or length > best['retained_tokens']):
             best = {'prefix_tokens': prefix, 'source_tokens': source, 'retained_tokens': length}
     return best
 
 
-def choose_boundary(snapshot, owner, candidates, encode, turn, context):
+def choose_boundary(snapshot, owner, candidates, encode, turn, context, image_pad=None):
     """Prefer the requested boundary, then nearest earlier complete turns.
 
     The frontend owns semantic turn boundaries; this endpoint owns exact wire
@@ -84,7 +91,7 @@ def choose_boundary(snapshot, owner, candidates, encode, turn, context):
         # never adopts an overlarge retained envelope just to obtain cache reuse.
         if len(ids) + 4096 > context * 0.8:
             continue
-        match = retained_match(snapshot['ids'], ids, turn)
+        match = retained_match(snapshot['ids'], ids, turn, image_pad)
         if match:
             return {'boundary': boundary, 'reason': 'aligned', **match}
     return {'boundary': None, 'reason': 'no-budgeted-aligned-turn'}

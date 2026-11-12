@@ -795,10 +795,13 @@ bool get_payload(In& in, SavedConversation& s) {
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
     }
-    if (in.version == 2) {
-        const uint64_t bound = in.limits.max_tokens == UINT64_MAX ? UINT64_MAX : in.limits.max_tokens + 1;
-        if (!in.vec(s.history_positions, bound) || s.history_positions.empty() || !s.live.imgs.empty() ||
-            !strata::history::positions_valid(s.history_positions, s.live.ids.size()))
+    if (in.version >= 2) {
+        const uint64_t axes = in.version == 3 ? 3 : 1;
+        const uint64_t bound = in.limits.max_tokens >= UINT64_MAX/axes - 1 ? UINT64_MAX : (in.limits.max_tokens + 1)*axes;
+        if (!in.vec(s.history_positions, bound) || s.history_positions.empty() ||
+            (in.version == 2 && !s.live.imgs.empty()) ||
+            (in.version == 3 && s.history_positions.size() != 3*(s.live.ids.size()+1)) ||
+            !strata::history::position_map_valid(s.history_positions, s.live.ids, s.live.imgs))
             return in.fail("invalid approximate history positions");
     }
     return true;
@@ -812,10 +815,10 @@ bool has_stage_parts(const SavedConversation& s) {
 
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, bool history = false) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint32_t version = kVersion) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
-    const uint32_t version = history ? 2 : kVersion, size = kHeader;
+    const uint32_t size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
@@ -1023,7 +1026,7 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
         n = sat_add(n, 7 * 8);
         for (uint64_t b : l.max_kv_bytes[(size_t) i]) n = sat_add(n, sat_add(8, b));
     }
-    n = sat_add(n, sat_add(8, sat_mul(sat_add(l.max_tokens, 1), 4)));
+    n = sat_add(n, sat_add(8, sat_mul(sat_add(l.max_tokens, 1), 12)));
     return std::min(n, l.max_file_bytes);
 }
 
@@ -1041,8 +1044,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
-    if (!strata::history::positions_valid(image.history_positions, image.live.ids.size()) ||
-        (!image.history_positions.empty() && !image.live.imgs.empty())) {
+    if (!strata::history::position_map_valid(image.history_positions, image.live.ids, image.live.imgs)) {
         error = "session file: invalid approximate history positions";
         return false;
     }
@@ -1084,7 +1086,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload, !image.history_positions.empty());
+    header_bytes(h, id, payload, image.history_positions.empty() ? 1 : image.live.imgs.empty() ? 2 : 3);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
@@ -1243,7 +1245,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion && version != 2) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    if (version != kVersion && version != 2 && version != 3) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
