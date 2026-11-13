@@ -44,6 +44,8 @@ inline void release_gpu_waits(std::FILE* f) {
 }
 /// --pipeline-windows: the pipelined loop's windows and the drafter's chain (set while that loop runs)
 inline std::atomic<DiagFn>& diag_pipeline_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
+/// Metal host phases and completed GPU segments (unset on other backends).
+inline std::atomic<DiagFn>& diag_metal_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 
 inline Progress& progress() {
     static Progress p;

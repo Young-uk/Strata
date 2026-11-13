@@ -260,6 +260,7 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_MTP_CHAIN=0` | One GPU submission per draft step instead of one per round |
 | `STRATA_METAL_FUSE=0`, `STRATA_METAL_LAZY_FOLD=0` | Turn off two decode fusions (same tokens, slower) |
 | `STRATA_METAL_PROMPT_EXPERTS=v3` | The M5 layout for the prompt's expert GEMMs. Fails on an M1 Max, so it is off there (default v2) |
+| `STRATA_METAL_PROMPT_GU_K=32` | Experimental v2 gate/up K tile for Q2_0 and IQ2/IQ3 formats, retaining the 16×64 output tile. Unset keeps the original per-format choice. Validate on the selected device and pack. |
 | `STRATA_METAL_STREAM=1` / `=0` | Stream the experts from the SSD even when the pack fits / never (the default decides by size) |
 | `STRATA_METAL_CONTIG=0` | Streaming: read the model file even when the experts' copy is there |
 | `STRATA_METAL_ARENA_GB=N`, `STRATA_METAL_KEEP_FREE_GB=N` | Streaming: the arena's size, or the memory left to macOS |
@@ -269,6 +270,10 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_KEEP_HOST_WEIGHTS=1` | Streaming: keep the host code's own copies of the weights (2 to 3 GB) |
 | `STRATA_METAL_F16=1` / `=0` | Decode windows of a resident model: the GEMVs of Q2_0, Q3_K-Q6_K and IQ4_XS and the Q2_0 routed experts in fp16. On in the config setup writes for a resident IQ3_S or Q2_0 pack (M5 Max: decode +9 to +15%, top-1 96-97% and mean KL 0.009-0.016 against fp32; the 61-task quality suite passes the same tasks as with it off); `=0` in the config's `env` turns it off. Other sets: off unless set. M1 Max: a 2-token window's GPU time 56-60 -> 40-41 ms, mean KL 0.009 against fp32 |
 | `STRATA_METAL_TRACE=1`, `STRATA_METAL_PROFILE=1`, `STRATA_METAL_KPROF=T` | Per-window traces, a time breakdown, per-kernel GPU times |
+| `STRATA_METAL_ACTIVITY=1` | Qwen: cumulative CPU wall times for input preparation, PLE reads, shader compilation, graph encoding, GPU/event waits and expert callbacks, printed after each prompt chunk. Nested stages overlap; do not sum these as GPU compute time. The watchdog reports completed GPU segments and commands even with timing off. |
+| `STRATA_METAL_IO_PROFILE=1` | Qwen expert-stream counters by foreground/summary bank. One line per prompt chunk, first/every 100 windows. `=2` logs every window for isolated tests. Expert-wait and callback times are wall time; I/O-worker time overlaps across threads and GPU work, and completed read-ahead can cross windows. Never sum these with GPU command span as exclusive compute time. Unset leaves logging/timers off. |
+
+`STRATA_METAL_STAGE_PROFILE=1` profiles one segmented Qwen graph (the first by default; `STRATA_METAL_STAGE_PROFILE_AT=N` selects a later graph for decode inspection) using GPU timestamps. It splits encoders at existing buffer barriers and groups kernels, so it is diagnostic rather than a normal-path throughput measurement. It requires stage-boundary timestamp support and disables cached summaries.
 
 ## How it works
 
@@ -325,3 +330,10 @@ and ALU, not by memory. The prompt kernels run 68 ms a layer against 62 ms for I
 | CUDA GPU experts -> CUDA CPU experts (noise floor) | 95.80% | 0.0186 | 0.195 | 4.462 / 4.477 |
 | CUDA GPU experts -> Mac | 95.46% | 0.0207 | 0.241 | 4.486 / 4.477 |
 | CUDA CPU experts -> Mac | 95.38% | 0.0187 | 0.272 | 4.486 / 4.462 |
+
+
+`STRATA_ATOMIC_PROMPT_TRACE=1` enables hash-only managed-server prefix diagnostics. Logs identify changed tool catalogues, template options, historical message indexes and rendered input prefixes alongside native reuse counts. They never include dialogue text. Optional hashes can survive a verified disk checkpoint; they do not grant clone eligibility. Disabled by default; the personal Atomic policy opts in.
+
+`STRATA_ATOMIC_RECENT_CHECKPOINT=1`, together with `STRATA_ATOMIC_SUMMARY_CHECKPOINTS=1`, saves a fourth compatible disk checkpoint near the deepest one. It retains the oldest and middle anchors, respects pinned prefixes, and includes extra copies in memory admission. File format and native reader are unchanged. Old archives acquire an extra anchor only after inference creates it and a later save retains it.
+
+`STRATA_METAL_PREPARE_BEFORE_READY=1` prepares the expert arena and prompt scratch before READY, using the allocation-only state-bank resource preparation path. It runs no inference and changes no conversation state. It supports the qualified non-MTP window configuration. It moves work into startup without removing cold-start work or changing the arena budget. Both options are disabled by default.

@@ -68,6 +68,9 @@ add_executable(runtime_hello tests/runtime_hello.cpp)
 target_link_libraries(runtime_hello PRIVATE strata_core_metal)
 enable_testing()
 add_test(NAME runtime_hello COMMAND runtime_hello)
+add_test(NAME metal_activity_test COMMAND metal_activity_test)
+add_test(NAME io_profile_test COMMAND io_profile_test)
+add_test(NAME metal_graph_activity_test COMMAND metal_graph_activity_test)
 
 # The engine: ggml (the native expert formats' type traits and ggml-cpu) from the tree vendored in third_party/strata-ggml (frozen at the
 # commit the PC build pins, 3cf03257).  -DSTRATA_GGML_DIR=<llama.cpp checkout> builds from that checkout instead (an override kept for two releases).

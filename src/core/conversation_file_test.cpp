@@ -727,6 +727,21 @@ int main() {
         check(session_save_checkpoints(anchors, live, agree, out, why, 3) && out.size() == 3 &&
               out[0].ids.size() == 700 && out[1].ids.size() == 10 && out[2].ids.size() == 350,
               "save: opted-in deepest, oldest and middle prefix states survive");
+        auto nearby = anchors;
+        nearby.push_back(checkpoint(680, 4)); nearby.back().ids.assign(680, 7);
+        nearby.push_back(checkpoint(690, 5)); nearby.back().ids.assign(690, 8); // unrelated branch
+        const uint64_t nearby_peak = session_save_peak_bytes(&nearby[1], live) +
+            2 * nearby[0].bytes() + 2 * nearby[2].bytes() + 2 * nearby[3].bytes();
+        check(!session_save_checkpoints(nearby, live, refuse, out, why, 4) && asked == nearby_peak && out.empty(),
+              "save: fourth anchor included in preflight before copying");
+        check(session_save_checkpoints(nearby, live, agree, out, why, 4) && out.size() == 4 &&
+              out[0].ids.size() == 700 && out[1].ids.size() == 10 && out[2].ids.size() == 350 && out[3].ids.size() == 680,
+              "save: recent compatible prefix added without removing recovery anchors");
+        check(session_save_checkpoints(nearby, live, agree, out, why, 3) && out.size() == 3 && out[2].ids.size() == 350,
+              "save: three-anchor policy remains unchanged");
+        nearby[0].pinned = true;
+        check(session_save_checkpoints(nearby, live, agree, out, why, 4) && out.size() == 1 && out[0].ids.size() == 10,
+              "save: fourth anchor cannot cross a pinned shared prefix");
         anchors[0].ids[0] = 8;
         check(session_save_checkpoints(anchors, live, agree, out, why, 3) && out.size() == 2,
               "save: unrelated checkpoint is excluded");

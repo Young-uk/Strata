@@ -24,6 +24,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/core/metal_activity.hpp"
 #include "strata/core/dflash2.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/conversation_cache.hpp"
@@ -297,6 +298,7 @@ public:
     bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs,
                    float min_p, int* n_drafts, std::string& err);
     bool mtp_loaded() const { return mtp_on_; }
+    bool prepare_shared_resources(std::string& err);
     // ---- DFlash2 (dflash2.inc): the taps of the tapped layers and the drafter
     bool taps_enable(const std::vector<int>& layers, std::string& err);
     void taps_set_cb(int64_t first_pos, const std::function<bool(const float*, int64_t, int64_t, std::string&)>& cb) { tap_first_ = first_pos; tap_cb_ = cb; }
@@ -537,6 +539,13 @@ private:
     int seg_T_ = 0;
     bool stream_arena(std::string& err);
     double run_ds(Cached& c);
+    IoProfile io_profiles_[4];
+    void record_io(const IoCounters& before, int rows, double span_ms, bool prompt) {
+        auto& profile = io_profiles_[(summary_selected_ ? 2 : 0) + (prompt ? 1 : 0)];
+        profile.add(io_delta(before, st_->io_counters()), rows, span_ms);
+        if (prompt || metal_io_profile_mode() == 2 || profile.windows == 1 || profile.windows % 100 == 0)
+            profile.report(stderr, summary_selected_, prompt);
+    }
     // prompts on the matrix units (prompt_chunk below)
     struct PromptGemm;
     PromptGemm* pg_ = nullptr;
@@ -591,6 +600,7 @@ private:
     void logpos(int Tn, const int32_t* tokens, int64_t pos0, bool head);
     // STRATA_METAL_PROFILE=1: where a window's time goes, per window size (printed when the window goes away)
     struct Prof { int64_t n = 0; double pre = 0, rg = 0, gpu = 0, fin = 0, all = 0; };
+    uint64_t mtp_rounds_ = 0, mtp_computed_ = 0, mtp_returned_ = 0;
     std::map<int, Prof> prof_;
     Prof cprof_, dprof_;   // commit (folds), the draft rounds
     double tp_pre_ = 0, tp_rg_ = 0;
@@ -1651,7 +1661,11 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
 
 double Window::run_ds(Cached& c) {
     if (!stream_) return cx_->run_graph(c.ds);
-    return cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
+    const bool measure = metal_io_profile_mode() != 0;
+    const IoCounters before = measure ? st_->io_counters() : IoCounters{};
+    const double seconds = cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
+    if (measure) record_io(before, seg_T_, seconds*1000, false);
+    return seconds;
 }
 
 namespace {
@@ -2008,7 +2022,7 @@ void Window::print_prof(bool periodic) {
     prof_printed_ = !periodic;
     auto line = [](const char* what, const Prof& x) {
         if (x.n == 0) return;
-        std::fprintf(stderr, "strata metal profile: %-10s %6lld x  %.3f ms: host before %.3f, run_graph %.3f (GPU %.3f, so "
+        std::fprintf(stderr, "strata metal profile: %-10s %6lld x  %.3f ms: host before %.3f, run_graph %.3f (GPU span incl. host turns %.3f, so "
                              "encode/submit/wait %.3f), patch+finish %.3f\n", what, (long long) x.n, x.all / x.n, x.pre / x.n,
                      x.rg / x.n, x.gpu / x.n, (x.rg - x.gpu) / x.n, x.fin / x.n);
     };
@@ -2018,6 +2032,8 @@ void Window::print_prof(bool periodic) {
     }
     line("commit", cprof_);
     line("draft", dprof_);
+    if (mtp_rounds_) std::fprintf(stderr, "strata metal profile: MTP %llu rounds, %llu computed drafts, %llu returned drafts\n",
+        (unsigned long long)mtp_rounds_, (unsigned long long)mtp_computed_, (unsigned long long)mtp_returned_);
 }
 
 bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0) {
@@ -2122,7 +2138,7 @@ void Window::swap_state(SeqSet& o) {
 bool Window::summary_supported() const {
     // Diagnostic pending rows and destructive profiling replays are not sequence-bank state.
     for (const char* key : {"STRATA_METAL_LOGPOS", "STRATA_LOGPOS", "STRATA_METAL_SKIP",
-                            "STRATA_METAL_KPROF", "STRATA_METAL_STEPPROF", "STRATA_PROMPT_KPROF", "STRATA_METAL_STREAM_FAKE"})
+                            "STRATA_METAL_KPROF", "STRATA_METAL_STEPPROF", "STRATA_METAL_STAGE_PROFILE", "STRATA_PROMPT_KPROF", "STRATA_METAL_STREAM_FAKE"})
         if (std::getenv(key)) return false;
     return ready() && (!stream_ || st_ != nullptr) && !mtp_on_ && !df2_ && !taps_on_ && sets_.empty() &&
            !bigs_ok_ && gst_.size() == 36 && kq_.size() == 12 && allocation_max_cells_ >= 16384;
@@ -2147,6 +2163,27 @@ void Window::free_set(SeqSet& s) {
         for (auto& b : *v) cx_->free(b);
     cx_->free(s.pleHist);
 }
+bool Window::prepare_shared_resources(std::string& err) {
+    if (!summary_supported() || summary_saved_ || summary_selected_ || cut_ids_ != nullptr ||
+        pend_fold_ > 0 || pc_next_.valid()) {
+        err = "unsupported or active Metal resource preparation"; return false;
+    }
+    const char* ep = std::getenv("STRATA_METAL_PROMPT");
+    const char* ec = std::getenv("STRATA_METAL_PROMPT_CHUNK");
+    const int C = std::max(64, std::min(8192, ec ? std::atoi(ec) : 2048));
+    const char* eg = std::getenv("STRATA_METAL_PROMPT_GEMM");
+    if (!cx_->synchronize()) throw std::runtime_error("resource preparation GPU quiescence failed");
+    if (stream_) {
+        if (st_->ready() && !st_->quiesce(err)) return false;
+        if (!st_->ready() && !stream_arena(err)) return false;
+        if (!(ep && std::string(ep) == "window") && !(eg && std::string(eg) == "0") &&
+            !prompt_gemm_init(err)) return false;
+    } else if (!(ep && std::string(ep) == "window") && !pc_setup(C)) {
+        err = "prompt scratch preparation failed"; return false;
+    }
+    std::fprintf(stderr, "strata metal: shared resources prepared without inference\n");
+    return true;
+}
 bool Window::summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err, bool clone) {
     if (!summary_supported() || summary_saved_ || ss_ != &ss || ss.qsa_alloc != 12 || ss.qsa_ord0 != 0) {
         err = "unsupported Metal state-bank configuration"; return false;
@@ -2164,20 +2201,7 @@ bool Window::summary_begin(strata::core::SessionState& ss, const std::function<b
         // Cold summary admission must not depend on a prior foreground GEN.
         // Allocate the same expert arena and prompt scratch the foreground path
         // uses; do not evaluate tokens or replace the selected main state.
-        if (pend_fold_ > 0 || pc_next_.valid()) {
-            err = "main prompt work is still pending before resource preparation"; return false;
-        }
-        if (!cx_->synchronize()) throw std::runtime_error("summary resource GPU quiescence failed");
-        if (stream_) {
-            if (st_->ready() && !st_->quiesce(err)) return false;
-            if (!st_->ready() && !stream_arena(err)) return false;
-            if (!(ep && std::string(ep) == "window") && !(eg && std::string(eg) == "0") &&
-                !prompt_gemm_init(err)) return false;
-        } else if (!(ep && std::string(ep) == "window") && !pc_setup(C)) {
-            err = "summary prompt scratch preparation failed"; return false;
-        }
-        std::fprintf(stderr, "strata summary state: shared resources prepared without foreground inference\n");
-        return true;
+        return prepare_shared_resources(err);
     };
     if (!strata::core::SummaryStateBank::prepare_resources(resources_ready, admit, prepare_resources, err)) return false;
     std::unique_ptr<SeqSet> candidate;
@@ -3068,6 +3092,7 @@ bool Window::mtp_draft(int Tn, const int32_t* tokens, int64_t p, int a, int max_
     int n = 0;
     int32_t tok = tokens[a];
     if (chain_ && max_steps > 0) {
+        ++mtp_rounds_;
         std::vector<mtl::Dispatch> ds;
         nb_ = false;
         if (a > 0) mtp_encode(ds, R_, 0, a, tokens, p, false);
@@ -3078,6 +3103,7 @@ bool Window::mtp_draft(int Tn, const int32_t* tokens, int64_t p, int a, int max_
             mtp_pick(ds, j, j + 1 < max_steps);
         }
         cx_->run_graph(ds);
+        mtp_computed_ += max_steps;
         for (int j = 0; j < max_steps; ++j) {
             const float pj = dprob_.as<float>()[j];
             drafts[j] = dout_.as<int32_t>()[j];
@@ -3085,6 +3111,7 @@ bool Window::mtp_draft(int Tn, const int32_t* tokens, int64_t p, int a, int max_
             ++n;
             if (min_p > 0.0f && pj < min_p) break;
         }
+        mtp_returned_ += n;
         if (n_drafts) *n_drafts = n;
         return true;
     }
@@ -3142,6 +3169,14 @@ struct PgMm { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t
 int pg_unit(int t) { return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 ? 16 : 32; }
 // the v2 (M4) expert tiles: the K-quants need TK 128, Q8_0 / IQ4_XS TK 32 (their 32-value units), the rest TK 16
 std::string gu2_tile(int t) {
+    static const std::string requested = [] {
+        const char* e = std::getenv("STRATA_METAL_PROMPT_GU_K");
+        const std::string v = e ? e : "";
+        return v == "32" ? v : std::string();
+    }();
+    if (!requested.empty() && (t == ref::Q2_0 || t == ref::IQ3_XXS || t == ref::IQ3_S ||
+        t == ref::IQ2_XXS || t == ref::IQ2_XS || t == ref::IQ2_S))
+        return "_16_64_" + requested + "_2";
     if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return "_16_16_128_2";   // the M4's best (513fc615)
     if (t == ref::Q8_0 || t == ref::IQ4_XS) return "_16_64_32_2";
     return "_16_64_16_2";
@@ -3288,6 +3323,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         pend_fold_ = 0;
     }
     const int T = Tn;
+    strata::core::MetalActivityScope prepare("prompt input prepare", strata::core::metal_activity().prepare_us);
     // ---- the embeddings into every stream, the PLE rows
     {
         const gguf::Tensor& te = TN("token_embd.weight");
@@ -3309,8 +3345,12 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }
+        prepare.finish();
+        strata::core::MetalActivityScope gather("prompt PLE gather", strata::core::metal_activity().ple_us);
         if (!ss.ple.table->gather_batch(rows.data(), (size_t) T, p.emb.as<float>(), err)) return false;
     }
+    prepare.finish();
+    strata::core::MetalActivityScope build_graph("prompt graph prepare", strata::core::metal_activity().prepare_us);
     std::vector<mtl::Dispatch> ds;
     std::vector<int> cuts;
     nb_ = false;
@@ -3582,17 +3622,22 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                               mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
     }
+    build_graph.finish();
     const double t0 = now_ms();
     if (stream_) {
         seg_T_ = T;
         cut_ids_ = p.ids.as<int32_t>();
-        cx_->run_graph_seg(ds, cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
+        const bool measure = metal_io_profile_mode() != 0;
+        const IoCounters before = measure ? st_->io_counters() : IoCounters{};
+        const double seconds = cx_->run_graph_seg(ds, cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
         cut_ids_ = nullptr;
+        if (measure) record_io(before, T, seconds*1000, true);
     } else {
         cx_->run_graph(ds);
     }
     pg_ms_ += now_ms() - t0;
     pg_tok_ += T;
+    if (strata::core::metal_activity_timing()) strata::core::metal_activity_report(stderr);
     static const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
     if (trace) std::fprintf(stderr, "strata metal: prompt chunk pos %lld, %d rows: %.0f ms\n", (long long) pos0, T, now_ms() - t0);
     // the window's state after the chunk: the conv history turned, the PLE history and token window advanced
@@ -3789,6 +3834,10 @@ bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std:
     return g_the_window && g_the_window->history_compact(prefix, source, length, err);
 }
 bool window_summary_supported() { return g_the_window && g_the_window->summary_supported(); }
+bool window_prepare_resources(std::string& err) {
+    if (!g_the_window) { err = "Metal window is not initialized"; return false; }
+    return g_the_window->prepare_shared_resources(err);
+}
 bool window_continuation_supported() { return g_the_window && g_the_window->continuation_supported(); }
 uint64_t window_summary_capacity() { return g_the_window ? g_the_window->summary_clone_capacity() : 0; }
 uint64_t window_summary_bytes(bool clone) { return g_the_window ? g_the_window->summary_bytes(clone) : 0; }

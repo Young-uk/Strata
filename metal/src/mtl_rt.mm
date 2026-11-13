@@ -4,8 +4,13 @@
 
 #include "mtl_rt.h"
 #include "resource_path.h"
+#if !defined(STRATA_DS4_RUNTIME)
+#include "strata/core/metal_activity.hpp"
+#endif
 
 #include <chrono>
+#include <algorithm>
+#include <map>
 #if defined(STRATA_DS4_RUNTIME)
 #include <execinfo.h>
 #include <algorithm>
@@ -343,6 +348,9 @@ int Context::compile(const std::vector<std::string>& files, const std::string& p
 
 // The same, and a failure is returned (-1, the compiler's message in *why) instead of ending the process: for a library that has a fallback.
 int Context::compile_try(const std::vector<std::string>& files, const std::string& prelude, bool fast_math, std::string* why) {
+#if !defined(STRATA_DS4_RUNTIME)
+    strata::core::MetalActivityScope compiling("shader library compile", strata::core::metal_activity().compile_us);
+#endif
     std::string src = prelude + "\n#include <metal_stdlib>\nusing namespace metal;\n";
     if (!ggml_common_path.empty() && prelude.find("NO_GGML_COMMON") == std::string::npos) {
         src += "#define GGML_COMMON_DECL_METAL\n#define GGML_COMMON_IMPL_METAL\n";
@@ -498,6 +506,9 @@ Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
 
 Pipeline Context::pipeline_uncached(int lib, const std::string& fn, const Constants& c) {
 #endif
+#if !defined(STRATA_DS4_RUNTIME)
+    strata::core::MetalActivityScope compiling("shader pipeline compile", strata::core::metal_activity().compile_us);
+#endif
     NSError* err = nil;
     id<MTLFunction> f;
     NSString* name = [NSString stringWithUTF8String:fn.c_str()];
@@ -555,6 +566,9 @@ Pipeline Context::pipeline_uncached(int lib, const std::string& fn, const Consta
     if (g_device_name == "unknown GPU") g_device_name = [[impl_->dev name] UTF8String];
 #else
     g_device_name = [[impl_->dev name] UTF8String];
+#endif
+#if !defined(STRATA_DS4_RUNTIME)
+    strata::core::progress_beat(); // a pipeline actually compiled, not a repeated wait poll
 #endif
     return p;
 }
@@ -1035,20 +1049,35 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
     }
 }
 
+#include "stage_profile.h"
+
 double Context::run_graph(const std::vector<Dispatch>& ds, size_t count) {
     // The wait spins on the buffer's status for up to 20 ms before it blocks: waitUntilCompleted's thread wake costs ~0.5 ms
     // a window (M5 Max, Q2_0 decode: +5% tok/s, same tokens).  STRATA_METAL_SPIN=0: the blocking wait.
     static const bool spin = !(std::getenv("STRATA_METAL_SPIN") && std::string(std::getenv("STRATA_METAL_SPIN")) == "0");
     @autoreleasepool {
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::MetalActivityScope encoding("graph encode", strata::core::metal_activity().encode_us);
+#endif
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         const size_t nd = std::min(count, ds.size());
         for (size_t i = 0; i < nd; ++i) {
             if (i > 0 && ds[i].barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode(enc, ds[i]);
+#if !defined(STRATA_DS4_RUNTIME)
+            if ((i + 1) % 128 == 0) strata::core::metal_encoded(128);
+#endif
         }
         [enc endEncoding];
         [cb commit];
+#if !defined(STRATA_DS4_RUNTIME)
+        if (nd % 128) strata::core::metal_encoded(nd % 128);
+        encoding.finish();
+#endif
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::MetalActivityScope waiting("command wait", strata::core::metal_activity().wait_us);
+#endif
         if (spin) {
             const auto t0 = std::chrono::steady_clock::now();
             while (cb.status < MTLCommandBufferStatusCompleted &&
@@ -1059,21 +1088,34 @@ double Context::run_graph(const std::vector<Dispatch>& ds, size_t count) {
             std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
             std::exit(5);
         }
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::metal_command_completed();
+#endif
         return cb.GPUEndTime - cb.GPUStartTime;
     }
 }
 
 void* Context::run_graph_async(const std::vector<Dispatch>& ds) {
     @autoreleasepool {
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::MetalActivityScope encoding("async graph encode", strata::core::metal_activity().encode_us);
+#endif
         if (impl_->q2 == nil) impl_->q2 = [impl_->dev newCommandQueue];
         id<MTLCommandBuffer> cb = [impl_->q2 commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         for (size_t i = 0; i < ds.size(); ++i) {
             if (i > 0 && ds[i].barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode(enc, ds[i]);
+#if !defined(STRATA_DS4_RUNTIME)
+            if ((i + 1) % 128 == 0) strata::core::metal_encoded(128);
+#endif
         }
         [enc endEncoding];
         [cb commit];
+#if !defined(STRATA_DS4_RUNTIME)
+        if (ds.size() % 128) strata::core::metal_encoded(ds.size() % 128);
+        encoding.finish();
+#endif
         return (__bridge_retained void*) cb;
     }
 }
@@ -1082,11 +1124,17 @@ double Context::wait_async(void* token) {
     if (token == nullptr) return 0.0;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>) token;
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::MetalActivityScope waiting("async command wait", strata::core::metal_activity().wait_us);
+#endif
         if (cb.status < MTLCommandBufferStatusCompleted) [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
             std::exit(5);
         }
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::metal_command_completed();
+#endif
         return cb.GPUEndTime - cb.GPUStartTime;
     }
 }
@@ -1097,37 +1145,73 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
         if (impl_->ev == nil) impl_->ev = [impl_->dev newSharedEvent];
         id<MTLSharedEvent> ev = impl_->ev;
         const uint64_t base = impl_->ev_v;
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::MetalActivityScope encoding("graph encode", strata::core::metal_activity().encode_us);
+#endif
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
+#if !defined(STRATA_DS4_RUNTIME)
+        StageProfile profile(impl_->dev, ds, cuts);
+#endif
         size_t i = 0;
         for (size_t s = 0; s <= cuts.size(); ++s) {
             const size_t end = s < cuts.size() ? (size_t) cuts[s] : ds.size();
+#if !defined(STRATA_DS4_RUNTIME)
+            if (profile.samples) {
+                profile.segment(cb, ds, i, end);
+                i = end;
+            } else
+#endif
+            {
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
             const size_t first = i;
             for (; i < end; ++i) {
                 if (i > first && ds[i].barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 encode(enc, ds[i]);
+#if !defined(STRATA_DS4_RUNTIME)
+                if ((i + 1) % 128 == 0) strata::core::metal_encoded(128);
+#endif
             }
             [enc endEncoding];
+            }
             if (s < cuts.size()) {
                 [cb encodeSignalEvent:ev value:base + 2 * s + 1];
                 [cb encodeWaitForEvent:ev value:base + 2 * s + 2];
             }
         }
         [cb commit];
+#if !defined(STRATA_DS4_RUNTIME)
+        if (ds.size() % 128) strata::core::metal_encoded(ds.size() % 128);
+        encoding.finish();
+#endif
         for (size_t s = 0; s < cuts.size(); ++s) {
             const uint64_t want = base + 2 * s + 1;
+#if !defined(STRATA_DS4_RUNTIME)
+            strata::core::MetalActivityScope waiting("segment wait", strata::core::metal_activity().wait_us);
+#endif
             while (ev.signaledValue < want) {
                 if (cb.status >= MTLCommandBufferStatusCompleted) break;   // an error: the wait below reports it
             }
+#if !defined(STRATA_DS4_RUNTIME)
+            waiting.finish();
+            if (ev.signaledValue >= want) strata::core::metal_segment_completed();
+            strata::core::MetalActivityScope callback("expert host callback", strata::core::metal_activity().callback_us);
+#endif
             at_cut(user, (int) s);
             ev.signaledValue = base + 2 * s + 2;
         }
         impl_->ev_v = base + 2 * cuts.size() + 2;
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::MetalActivityScope final_wait("final command wait", strata::core::metal_activity().wait_us);
+#endif
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
             std::exit(5);
         }
+#if !defined(STRATA_DS4_RUNTIME)
+        strata::core::metal_command_completed();
+        profile.report();
+#endif
         return cb.GPUEndTime - cb.GPUStartTime;
     }
 }

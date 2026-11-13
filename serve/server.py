@@ -6185,6 +6185,14 @@ class Service:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
         if req is not None:
             self.set_restore_points(req, ids, bool(images) or ds_pics)
+        if (cancel is not None and req is not None and req.get("atomic_summary") is not True and
+                os.environ.get("STRATA_ATOMIC_PROMPT_TRACE") == "1"):
+            try:
+                from serve.prompt_trace import capture
+                cancel._atomic_prompt_trace = capture(messages, tools, kwargs, ids, req.get("atomic_cache_owner"))
+            except Exception:
+                # Diagnostics cannot refuse or rewrite a generation request.
+                cancel._atomic_prompt_trace = None
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def deepseek_turn_ids(self):
@@ -6552,7 +6560,18 @@ class Service:
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
+        prefix_trace = getattr(cancel, "_atomic_prompt_trace", None)
+        prefix_observation = None
+        prefix_started = False
         def queue_started():
+            nonlocal prefix_observation, prefix_started
+            if prefix_trace and not prefix_started:
+                prefix_started = True
+                try:
+                    from serve.prompt_trace import compare
+                    prefix_observation = compare(getattr(self.engine, "atomic_prompt_trace", None), prefix_trace, ids)
+                except Exception:
+                    prefix_observation = None
             with self.status_lock:
                 row = self.terminal_requests.get(request_id)
                 if row is not None and row["state"] != "reading":
@@ -6949,6 +6968,15 @@ class Service:
                     with self.status_lock:
                         if st.get("busy") and not timed_out:
                             last = request_stats(segments)          # only this request's own DONEs count
+                            if sampling.get("atomic_summary") is not True:
+                                trace_owner_current = getattr(self.engine, "atomic_disk_owner", sampling.get("atomic_cache_owner")) == sampling.get("atomic_cache_owner")
+                                if trace_owner_current:
+                                    self.engine.atomic_prompt_trace = (prefix_trace if prefix_started and
+                                        finish in ("stop", "length") and not cancel.is_set() else None)
+                                if prefix_started and prefix_observation is not None:
+                                    print("[strata] cache-prefix " + json.dumps({**prefix_observation,
+                                        "request": request_id, "reused_tokens": last.get("reused"),
+                                        "cache_owner_current": trace_owner_current, "finish": finish}, sort_keys=True), flush=True)
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")

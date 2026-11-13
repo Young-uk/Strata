@@ -108,6 +108,7 @@ class DiskSession:
     def restore(self, engine):
         engine.atomic_main_snapshot = None
         engine.atomic_disk_restored_receipt = None
+        engine.atomic_prompt_trace = None
         try:
             record = self._record()
         except FileNotFoundError:
@@ -123,13 +124,28 @@ class DiskSession:
         if isinstance(owner, str) and 0 < len(owner) <= 256 and result['tokens'] > 0:
             engine.atomic_disk_restored_receipt = {'owner': owner, 'tokens': result['tokens']}
         binding = self._binding(record.get('clone_binding'), result['tokens'])
+        session_digest = None
+        def saved_digest():
+            nonlocal session_digest
+            if session_digest is None:
+                session_digest = self._sha256(self.directory / record['file'])
+            return session_digest
         # The native FORK also checks the committed token count and token hash.
         # Legacy manifests restore inference state but cannot claim a clone owner.
         if (binding and record.get('session_sha256') ==
-                self._sha256(self.directory / record['file'])):
+                saved_digest()):
             from serve.history_plan import restored_ids
             ids = restored_ids(self.directory / record['file'], binding)
             engine.atomic_main_snapshot = {**binding, 'restored': True, **({'ids': ids} if ids is not None else {})}
+        # A trace is diagnostic metadata, never a substitute for clone admission.
+        # Authenticate it against the saved native file before comparing across restarts.
+        trace = record.get('prompt_trace')
+        if isinstance(trace, dict) and trace.get('state_tokens') == result['tokens']:
+            from serve.prompt_trace import validated, digest
+            descriptor = validated(trace.get('descriptor'))
+            if (descriptor and descriptor['owner_hash'] == digest(owner) and
+                    record.get('session_sha256') == saved_digest()):
+                engine.atomic_prompt_trace = descriptor
         if record.get('identity') != self.identity:
             print('[strata] disk session accepted through reviewed update compatibility', flush=True)
         print(f"[strata] disk session restored: {result['tokens']} tokens", flush=True)
@@ -187,6 +203,12 @@ class DiskSession:
             if binding:
                 record['clone_binding'] = binding
                 record['session_sha256'] = self._sha256(path)
+            from serve.prompt_trace import validated, digest
+            trace = validated(getattr(engine, 'atomic_prompt_trace', None))
+            if trace and trace['owner_hash'] == digest(owner):
+                record['prompt_trace'] = {'state_tokens': result['tokens'], 'descriptor': trace}
+                if 'session_sha256' not in record:
+                    record['session_sha256'] = self._sha256(path)
             temp = self.directory / (name + '.json.tmp')
             try:
                 with temp.open('x', encoding='utf-8') as out:

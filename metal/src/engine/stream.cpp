@@ -318,7 +318,10 @@ void ExpertStream::io_main() {
             else { j = pre_q_.front(); pre_q_.pop_front(); }
             slots_[(size_t) j.slot].state = 2;
         }
+        const bool measure_io = metal_io_profile_mode() != 0;
+        const double read_start = measure_io ? now_ms() : 0;
         read_part(j.slot, j.layer, j.e, j.part);
+        if (measure_io) io_worker_us_.fetch_add(uint64_t((now_ms()-read_start)*1000), std::memory_order_relaxed);
         bool done = false;
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -822,7 +825,15 @@ void ExpertStream::reset_stats() {
     p_wait_ms_ = p_host_ms_ = 0;
     bytes_read_ = 0;
     reads_ = 0;
+    io_worker_us_ = 0;
     wait_ms_ = host_ms_ = 0;
+}
+
+IoCounters ExpertStream::io_counters() const {
+    // The submission thread owns lookup/wait counters. I/O workers publish only atomics.
+    return {bytes_read_.load(std::memory_order_relaxed), reads_.load(std::memory_order_relaxed),
+            io_worker_us_.load(std::memory_order_relaxed), hits_+p_hits_, pre_hits_+p_pre_, misses_+p_misses_,
+            wait_ms_+p_wait_ms_, host_ms_+p_host_ms_};
 }
 
 void ExpertStream::report(FILE* f) const {

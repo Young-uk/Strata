@@ -1189,6 +1189,18 @@ bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, 
             if (middle) selected.push_back(middle);
         }
     }
+    // A nearby periodic anchor avoids rereading from the middle after an edit
+    // just before the deepest (usually pre-answer) checkpoint. Keep the older
+    // recovery anchors as well; unchanged unless a fourth checkpoint is opted in.
+    if (deepest && max_checkpoints > 3) {
+        const ConversationCheckpoint* recent = nullptr;
+        for (const auto& c : chain)
+            if (!c.ids.empty() && c.ids.size() < deepest->ids.size() && c.stage_parts.empty() &&
+                std::equal(c.ids.begin(), c.ids.end(), deepest->ids.begin()) &&
+                std::find(selected.begin(), selected.end(), &c) == selected.end() &&
+                (!recent || c.ids.size() > recent->ids.size())) recent = &c;
+        if (recent) selected.push_back(recent);
+    }
     uint64_t peak = session_save_peak_bytes(deepest, live);
     for (size_t i = 1; i < selected.size(); ++i) peak = sat_add(peak, sat_mul(2, selected[i]->bytes()));
     if (admit && !admit(peak, why)) return false;

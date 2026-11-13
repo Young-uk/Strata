@@ -30,6 +30,33 @@ class DiskTests(unittest.TestCase):
         self.cache.restore(fresh)
         self.assertEqual(fresh.atomic_main_snapshot, {**binding, 'restored':True})
 
+    def test_trace_and_clone_share_one_checkpoint_hash_read(self):
+        from serve.prompt_trace import capture
+        from unittest.mock import patch
+        self.engine.atomic_disk_owner='thread/turn'
+        self.engine.atomic_main_snapshot={'owner':'thread/turn','tokens':123,'hash':42,'tail':2,'history_hash':'c'*64}
+        self.engine.atomic_prompt_trace=capture([{'role':'user','content':'data'}],[],{},[1,2,3],'thread/turn')
+        self.cache.save(self.service())
+        with patch.object(self.cache,'_sha256',wraps=self.cache._sha256) as hashed:
+            fresh=Engine();self.cache.restore(fresh)
+            self.assertIsNotNone(fresh.atomic_main_snapshot)
+            self.assertIsNotNone(fresh.atomic_prompt_trace)
+            self.assertEqual(hashed.call_count,1)
+
+    def test_hash_only_prompt_trace_survives_without_inventing_clone_binding(self):
+        from serve.prompt_trace import capture
+        self.engine.atomic_disk_owner = 'thread/turn'
+        self.engine.atomic_prompt_trace = capture([{'role':'user','content':'PRIVATE_SENTINEL'}], [], {}, [1,2,3], 'thread/turn')
+        self.cache.save(self.service())
+        record = self.cache.manifest.read_text()
+        self.assertNotIn('PRIVATE_SENTINEL', record)
+        fresh = Engine(); self.cache.restore(fresh)
+        self.assertEqual(fresh.atomic_prompt_trace, self.engine.atomic_prompt_trace)
+        self.assertIsNone(fresh.atomic_main_snapshot)
+        value=json.loads(record);value['prompt_trace']['state_tokens']+=1
+        self.cache.manifest.write_text(json.dumps(value));self.cache.restore(fresh)
+        self.assertIsNone(fresh.atomic_prompt_trace)
+
     def test_restored_owner_and_count_never_invent_clone_ids_or_history(self):
         self.engine.atomic_disk_owner = 'thread/turn'
         self.cache.save(self.service())

@@ -156,6 +156,10 @@
 #include <unistd.h>
 #include <cerrno>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/resource.h>
+#endif
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
 #include <sys/sysmacros.h>
 #endif
@@ -167,6 +171,7 @@ namespace strata::metal_engine {
 bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* const* embd_rows,
                 const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err);
 bool window_summary_supported();
+bool window_prepare_resources(std::string& err);
 bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err);
 bool window_continuation_supported();
 uint64_t window_summary_bytes(bool clone = false);
@@ -1548,6 +1553,14 @@ MemSample mem_sample() {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
+#elif defined(__APPLE__)
+    rusage_info_v2 info{};
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V2, (rusage_info_t*)&info) == 0) {
+        m.faults = info.ri_pageins;
+        m.rss_mib = info.ri_resident_size >> 20;
+        m.commit_mib = info.ri_phys_footprint >> 20;
+    }
+    if (const auto mem = strata::core::sample_host_memory()) m.avail_mib = mem->available >> 20;
 #else
     if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
         char buf[4096];
@@ -1614,6 +1627,11 @@ static uint64_t file_tier_activity() {
     // thread waiting on one page at a time), which at >> 6 is 3 a second and never counted as busy
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) total += pmc.PageFaultCount >> 3;
     return total;
+#elif defined(__APPLE__)
+    rusage_info_v2 info{};
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V2, (rusage_info_t*)&info) == 0)
+        return (info.ri_diskio_bytesread >> 20) + info.ri_pageins;
+    return 0;
 #else
     return 0;
 #endif
@@ -1888,6 +1906,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
         if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
         if (auto fn = strata::core::diag_pipeline_fn().load()) fn(f);
+        if (auto fn = strata::core::diag_metal_fn().load()) fn(f);
 #if !defined(_WIN32)
         disk_wait_threads(f);
 #endif
@@ -1896,6 +1915,8 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                      m.commit_mib,
 #if defined(_WIN32)
                      "committed", m.avail_mib, m.faults, "page faults so far"
+#elif defined(__APPLE__)
+                     "physical footprint", m.avail_mib, m.faults, "page-ins so far"
 #else
                      "in swap", m.avail_mib, m.faults, "major page faults so far"
 #endif
@@ -14254,6 +14275,17 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+#if defined(STRATA_GPU_METAL)
+        if (const char* warm = std::getenv("STRATA_METAL_PREPARE_BEFORE_READY"); warm && std::string(warm) == "1") {
+            const auto began = Clock::now();
+            if (!strata::metal_engine::window_prepare_resources(err)) {
+                std::fprintf(stderr, "strata metal: resource preparation before READY failed: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata metal: resources prepared before READY in %.1f ms (no inference)\n",
+                std::chrono::duration<double, std::milli>(Clock::now() - began).count());
+        }
+#endif
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -16568,7 +16600,9 @@ int main(int argc, char** argv) {
                         std::string why;
                         if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why,
                             std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS") &&
-                            std::string(std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS")) == "1" ? 3 : 1)) {
+                            std::string(std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS")) == "1" ?
+                                (std::getenv("STRATA_ATOMIC_RECENT_CHECKPOINT") &&
+                                 std::string(std::getenv("STRATA_ATOMIC_RECENT_CHECKPOINT")) == "1" ? 4 : 3) : 1)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
