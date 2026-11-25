@@ -13,7 +13,7 @@ namespace strata::core {
 struct NativeContinuation {
     static bool preparation_key_supported(const std::string& key) {
         for (const char* k : {"temperature", "top_p", "top_k", "min_p", "penalty_last_n", "penalty_repeat",
-            "penalty_freq", "penalty_present", "seed", "pen_from", "logit_bias", "cvec", "logprobs", "allowed",
+            "penalty_freq", "penalty_present", "seed", "pen_from", "logit_bias", "cvec", "logprobs", "eos_trace", "allowed",
             "ckpt", "pin", "img_keys", "history"}) if (key == k) return true;
         return false;
     }
@@ -25,6 +25,8 @@ struct NativeContinuation {
     size_t penalty_origin = 0;
     bool cache = true;
     int logprobs = -1;
+    bool eos_trace = false;
+    std::vector<int32_t> pending_drafts;
     std::vector<float> bias;
     std::vector<int32_t> allowed;
     // Failed/cancelled admission must never report another conversation's live

@@ -14,7 +14,7 @@ import uuid
 
 
 class DiskSession:
-    def __init__(self, directory, identity, max_bytes=4 * 1024**3, previous_backend_sha256=None, reviewed_upgrades=None):
+    def __init__(self, directory, identity, max_bytes=4 * 1024**3, previous_backend_sha256=None, reviewed_upgrades=None, *, save_migration_checkpoint=False):
         self.directory = Path(directory)
         if not self.directory.is_absolute() or self.directory.is_symlink():
             raise ValueError('disk session directory must be an absolute non-symlink path')
@@ -50,6 +50,7 @@ class DiskSession:
             if (identity.get('atomic_summary_expected_native_sha256') == upgrade['current_native'] and
                     identity.get('atomic_summary_expected_model_fingerprint') == upgrade['current_model']):
                 self.compatible_identities.add(hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest())
+        self.save_migration_checkpoint = save_migration_checkpoint
         self.max_bytes = max_bytes
         self.manifest = self.directory / 'latest.json'
 
@@ -109,12 +110,15 @@ class DiskSession:
         engine.atomic_main_snapshot = None
         engine.atomic_disk_restored_receipt = None
         engine.atomic_prompt_trace = None
+        engine.atomic_mtp_base_restored = False
         try:
             record = self._record()
         except FileNotFoundError:
             return None
         if not record or self._deleted(self._thread(record.get('cache_owner'))):
             return None
+        if record.get('mtp_base_only') is True:
+            return self._restore_base_record(engine, record)
         engine.atomic_disk_owner = record.get('cache_owner')
         result = engine.session_file('restore', str(self.directory / record['file']))
         # This is not a clone receipt: no token IDs, tail or semantic hash
@@ -151,6 +155,25 @@ class DiskSession:
         print(f"[strata] disk session restored: {result['tokens']} tokens", flush=True)
         return result
 
+    def restore_mtp_base(self, engine):
+        """Try a verified MTP-off publication without granting a clone receipt."""
+        try:
+            record = self._record()
+        except FileNotFoundError:
+            return None
+        thread = self._thread(record.get('cache_owner')) if record else None
+        if not thread or self._deleted(thread):
+            return None
+        return self._restore_base_record(engine, record)
+
+    def _restore_base_record(self, engine, record):
+        result = engine.session_file('restore_base', str(self.directory / record['file']))
+        if result['tokens'] <= 0:
+            raise RuntimeError('base restoration produced no checkpoint')
+        engine.atomic_mtp_base_restored = True
+        print(f"[strata] MTP base checkpoint restored: {result['tokens']} tokens", flush=True)
+        return result
+
     def save(self, service):
         if not service.loaded():
             return None
@@ -181,12 +204,27 @@ class DiskSession:
                 old = self._record(require_identity=False)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
-            result = engine.session_file('save', str(path))
+            base_only = False
+            if getattr(engine, 'atomic_mtp_base_restored', False):
+                action = 'save_migrated'
+            elif self.save_migration_checkpoint:
+                action = 'save_base'
+            else:
+                action = 'save'
+            try:
+                result = engine.session_file(action, str(path))
+                base_only = action == 'save_migrated'
+            except ValueError as exc:
+                if action == 'save' or getattr(exc, 'published', None) is not False or getattr(exc, 'kind', None) != 'invalid':
+                    raise
+                result = engine.session_file('save', str(path))
             size = path.stat().st_size
             if result['tokens'] <= 0 or size > self.max_bytes or size + (old['bytes'] if old else 0) > self.max_bytes:
                 raise ValueError('empty session or disk budget exceeded')
             os.chmod(path, 0o600)
             record = {'identity': self.identity, 'file': name, 'bytes': size, 'tokens': result['tokens']}
+            if base_only:
+                record['mtp_base_only'] = True
             sidecar = self.directory / (name + '.threads')
             if thread:
                 record['cache_owner'] = owner
@@ -200,7 +238,7 @@ class DiskSession:
                 sidecar.unlink(missing_ok=True)
                 return None
             binding = self._binding(getattr(engine, 'atomic_main_snapshot', None), result['tokens'])
-            if binding:
+            if binding and not base_only:
                 record['clone_binding'] = binding
                 record['session_sha256'] = self._sha256(path)
             from serve.prompt_trace import validated, digest

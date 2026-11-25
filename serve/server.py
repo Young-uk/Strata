@@ -1729,6 +1729,8 @@ class StrataEngine:
         # logprobs: the engine writes an `LP` line after each `T` line (an engine without them ignores
         # the key, so an older engine answers exactly as it did).  Absent = no LP lines at all.
         k = top_logprobs(sampling)
+        if sampling.get("_eos_trace_ids") and k is None:
+            keys += " eos_trace=1"
         if k is not None:
             keys += f" logprobs={k}"
             ids = allowed_ids(sampling)
@@ -2778,7 +2780,10 @@ class StrataEngine:
         # flush), read here before the token is yielded, so whoever takes the token finds its line in
         # lp_lines.  Not asked for = the deque stays empty and nothing on this path changes.
         want_lp = top_logprobs(sampling or {}) is not None
+        eos_trace_ids = (sampling or {}).get("_eos_trace_ids", ()) if not (want_lp or self.multi) else ()
         self.lp_lines = LPLines(cancel)
+        if eos_trace_ids:
+            cancel._strata_eos_trace = None
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         rid_key = f" rid={rid}" if rid is not None else ""
@@ -2857,6 +2862,16 @@ class StrataEngine:
                             carry = NO_LINE
                         if isinstance(carry, str) and carry.startswith("LP "):
                             self.lp_lines.append((t, carry))
+                            carry = NO_LINE
+                    if t in eos_trace_ids:
+                        try:
+                            carry = lines_q.get(timeout=0.5)
+                        except queue.Empty:
+                            carry = NO_LINE
+                        if isinstance(carry, str) and re.fullmatch(
+                            r"EOSLP (?:nan|-?\d+\.\d+ rank=\d+(?: \d+:-?\d+\.\d+){0,5})\n?", carry
+                        ):
+                            cancel._strata_eos_trace = (t, carry.strip())
                             carry = NO_LINE
                     yield t
                 elif line.startswith("PP "):
@@ -3121,6 +3136,8 @@ class StrataEngine:
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
         commands = {"save": ("SAVE", "SAVED"), "restore": ("RESTORE", "RESTORED"),
+                    "save_base": ("SAVE_BASE", "SAVED"), "restore_base": ("RESTORE_BASE", "BASE_RESTORED"),
+                    "save_migrated": ("SAVE_MIGRATED", "SAVED"),
                     "summary_begin": ("SUMMARY_BEGIN", "SUMMARY_HELD"),
                     "summary_end": ("SUMMARY_END", "SUMMARY_RELEASED")}
         if action not in commands or any(c in path for c in "\r\n\0"):
@@ -6401,6 +6418,9 @@ class Service:
         try:
             with self.summary_lane.register(sampling.get("atomic_summary") is True, cancel):
                 scheduler = self.summary_lane.scheduler
+                if scheduler is None and sampling.get("atomic_auxiliary_agent") is not None:
+                    raise atomic_summary.SummaryError("resident review agents require the priority state bank", 501,
+                                                     "atomic_auxiliary_agent_unavailable")
                 if scheduler is None:
                     yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
                 else:
@@ -6451,7 +6471,11 @@ class Service:
                     cancel._priority_owner = owner
                     try:
                         with priority.observation(self.engine):
-                            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
+                            if sampling.get("atomic_auxiliary_agent") is not None:
+                                from serve.auxiliary_agent import run as run_auxiliary_agent
+                                yield from run_auxiliary_agent(self, ids, max_new, sampling, cancel)
+                            else:
+                                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
                     finally:
                         scheduler.close(owner)
                         with self.status_lock:
@@ -6535,6 +6559,14 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        stop_token_id = None
+        first_content_token = None
+        if thinking and not (
+            getattr(self.engine, "multi", False) or getattr(self.engine, "split_engine", False)
+        ):
+            sampling = {**(sampling or {}), "_eos_trace_ids": self.stop_ids}
+        answer_chars = 0
+        emitted_tool = False
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -6753,6 +6785,7 @@ class Service:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
                                     finish = "stop"
+                                    stop_token_id = t
                                     raw_ids.append(t)
                                     break
                                 raw_ids.append(t)
@@ -6771,6 +6804,12 @@ class Service:
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
+                                    if ev.kind == "content":
+                                        if first_content_token is None and ev.text:
+                                            first_content_token = len(raw_ids)
+                                        answer_chars += len((ev.text or "").strip())
+                                    elif ev.kind in ("tool_start", "tool_call"):
+                                        emitted_tool = True
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
@@ -7077,7 +7116,26 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            if ev.kind == "content":
+                if first_content_token is None and ev.text:
+                    first_content_token = len(raw_ids) - int(stop_token_id is not None)
+                answer_chars += len((ev.text or "").strip())
+            elif ev.kind in ("tool_start", "tool_call"):
+                emitted_tool = True
+            if ev.kind in ("content", "tool_start", "tool_call"):
+                answered = True
             yield "event", ev
+        if thinking and raw_ids and not emitted_tool and answer_chars <= 32:
+            stop_source = ("token" if stop_token_id is not None else
+                           "sequence" if stops is not None and stops.hit is not None else
+                           "engine" if finish == "stop" else finish)
+            print(f"[strata] thinking ended with short or empty answer: request={request_id} finish={finish} "
+                  f"stop_source={stop_source} last_token_id={raw_ids[-1]} "
+                  f"stop_token_id={stop_token_id} parser_state={parser.state} answer_chars={answer_chars} "
+                  f"first_content_token={first_content_token} tail_token_ids={raw_ids[-8:]}", flush=True)
+            eos_scores = getattr(cancel, "_strata_eos_trace", None)
+            if finish == "stop" and eos_scores and eos_scores[0] == stop_token_id:
+                print(f"[strata] request={request_id} pre_sampling {eos_scores[1]}", flush=True)
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -8516,6 +8574,7 @@ def make_handler(svc: Service):
                                      "atomic_model_fingerprint": svc.atomic_model_fingerprint,
                                      "atomic_summary_slot": svc.summary_lane.enabled and not svc.summary_lane.poisoned,
                                      "atomic_summary_context": atomic_summary.CONTEXT,
+                                     **({"atomic_auxiliary_agent": 1} if svc.summary_lane.enabled and svc.summary_lane.mode == "state-bank-v1" and svc.summary_lane.scheduler else {}),
                                      "atomic_summary_clone": bool(getattr(svc.summary_lane, "clone_enabled", False)),
                                      "atomic_summary_clone_context": getattr(svc.engine, "summary_clone_context", None),
                                      "atomic_summary_protocol": 5 if svc.summary_lane.scheduler else 4 if svc.summary_lane.mode == "state-bank-v1" else 3,
@@ -9149,6 +9208,9 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if req.get("atomic_auxiliary_agent") is not None:
+                req["_atomic_auxiliary_messages"] = [dict(message) for message in messages]
+                req["_atomic_auxiliary_kwargs"] = dict(kw)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -10924,11 +10986,29 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         try:
             observed = atomic_summary.runtime_qualification_config(cfg, svc.engine)
             identity = atomic_summary.qualified_runtime_pins(observed)
+            bridge = cfg.get("atomic_mtp_disk_bridge")
+            mtp_active = "--mtp" in observed["args"]
+            base_source = None
+            if isinstance(bridge, dict):
+                if not mtp_active:
+                    raise ValueError("MTP cache profile requires an active MTP engine")
+                if Path(bridge["base_dir"]).resolve() == Path(cfg["atomic_disk_session_dir"]).resolve():
+                    raise ValueError("MTP and base cache directories must differ")
+                base_source = DiskSession(bridge["base_dir"], bridge["base_identity"])
             disk_session = DiskSession(cfg["atomic_disk_session_dir"], identity,
                 previous_backend_sha256=cfg.get("atomic_disk_session_previous_backend_sha256"),
-                reviewed_upgrades=cfg.get("atomic_disk_session_reviewed_upgrades"))
+                reviewed_upgrades=cfg.get("atomic_disk_session_reviewed_upgrades"),
+                save_migration_checkpoint=bridge is True and not mtp_active)
             try:
-                if disk_session.restore(svc.engine) is None:
+                restored = disk_session.restore(svc.engine)
+                if restored is None and base_source is not None:
+                    try:
+                        restored = base_source.restore_mtp_base(svc.engine)
+                    except SessionRefused as exc:
+                        if exc.published:
+                            raise
+                        print(f"[strata] MTP base checkpoint refused ({exc.kind}); starting cold", flush=True)
+                if restored is None:
                     print("[strata] disk session: no compatible saved session (cold start)", flush=True)
             except Exception as exc:
                 print(f"[strata] disk session restore failed ({type(exc).__name__}); starting cold", flush=True)

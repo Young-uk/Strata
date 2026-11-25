@@ -174,6 +174,8 @@ bool window_summary_supported();
 bool window_prepare_resources(std::string& err);
 bool window_history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err);
 bool window_continuation_supported();
+std::string mtp_model_file();
+std::string mtp_vocab_file();
 uint64_t window_summary_bytes(bool clone = false);
 uint64_t window_summary_capacity();
 bool window_summary_begin(strata::core::SessionState& ss, const std::function<bool()>& admit, std::string& err, bool clone = false);
@@ -241,9 +243,9 @@ static void df2_tap_dump(const float* dev, int64_t rows, int64_t pos0, int64_t f
 // Called only when the request asked (`req_logprobs >= 0`): a request without logprobs never reaches it, so the
 // default path does no work for this and prints exactly what it printed before.
 static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token, int k,
-                         const std::vector<int32_t>& allowed, const char* request_id = nullptr) {
+                         const std::vector<int32_t>& allowed, const char* request_id = nullptr, bool eos_trace = false) {
     if (k < 0) return;
-    const std::string tag = request_id ? std::string("ALP ") + request_id : "LP";
+    const std::string tag = eos_trace ? (request_id ? std::string("AEOSLP ") + request_id : "EOSLP") : request_id ? std::string("ALP ") + request_id : "LP";
     static std::vector<float> row;
     row.resize((size_t) ver.vocab());
     if (!ver.copy_logits(t, row.data()) || token < 0 || (size_t) token >= row.size()) {
@@ -256,6 +258,11 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
     for (const float v : row) se += std::exp((double) v - (double) mx);
     const double lse = (double) mx + std::log(se);
     std::printf("%s %.6f", tag.c_str(), (double) row[(size_t) token] - lse);
+    if (eos_trace) {
+        const float score = row[(size_t) token];
+        const auto ahead = std::count_if(row.begin(), row.end(), [score](float value) { return value > score; });
+        std::printf(" rank=%zu", (size_t) ahead + 1);
+    }
     if (!allowed.empty()) {
         // Only the ids the caller named; the server renormalises over them, which is what allowed_token_ids means.
         // The server refuses an id past the vocabulary with a 400 only when it can read the vocabulary size from the
@@ -12127,18 +12134,32 @@ int main(int argc, char** argv) {
         ConvCheckpoint::PromptPlan summary_plan;
         bool summary_nf_prompt = false, summary_short_read = false;
         bool summary_cvec_cached = true;
+        const bool foreground_mtp = use_mtp && !use_df2 && stages.empty() && !multi_gpu &&
+            o.peer_device < 1 && !o.batch && o.mmap_experts && o.spec >= 2 && o.spec <= 4 &&
+            std::getenv("STRATA_TEST_FOREGROUND_MTP") != nullptr;
         auto summary_supported = [&] {
             return stages.empty() && !multi_gpu && o.peer_device < 1 && o.batch == 0 &&
                    summary_prompt_cache > 0 && !use_mtp && !use_df2;
         };
+        // Scheduled summary quanta never invoke the drafter. Its Metal buffers
+        // stay owned by the parked foreground while the verifier bank is swapped.
+        const bool mtp_summary = foreground_mtp && summary_prompt_cache > 0 &&
+            std::getenv("STRATA_TEST_MTP_SUMMARY") != nullptr;
+        const bool mtp_history = mtp_summary && std::getenv("STRATA_TEST_MTP_HISTORY") != nullptr;
+        auto summary_bank_supported = [&] { return summary_supported() || mtp_summary; };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
         // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
         std::optional<uint64_t> model_fp, config_fp;
+        std::optional<uint64_t> base_model_fp, base_config_fp;
+        constexpr size_t draft_replay_tokens = 2051; // Metal draft attention includes the previous 2050 cells.
+        size_t draft_warmup_start = 0;
         auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
-                                    const std::function<void()>& next_file) -> bool {
-            if (!model_fp) {
+                                    const std::function<void()>& next_file, bool base = false) -> bool {
+            auto& model_hash = base ? base_model_fp : model_fp;
+            auto& config_hash = base ? base_config_fp : config_fp;
+            if (!model_hash) {
                 // what the loaders actually resolved: the CLI inputs, the pack's files and - from the expert source
                 // itself - every file its experts were read from (native_experts.txt can name GGUFs per layer/role)
                 strata::core::SessionInputs in;
@@ -12148,7 +12169,11 @@ int main(int argc, char** argv) {
                 in.embedding = o.embd_gguf;
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
+#if defined(STRATA_GPU_METAL)
+                if (!base && use_mtp) in.mtp = strata::metal_engine::mtp_model_file();
+#else
                 in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+#endif
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -12158,18 +12183,23 @@ int main(int argc, char** argv) {
                         files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
                     if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
                 }
-                if (!o.mtp.empty()) {
+                if (!base && !o.mtp.empty()) {
+#if defined(STRATA_GPU_METAL)
+                    const auto vocab = strata::metal_engine::mtp_vocab_file();
+                    if (!vocab.empty()) files.push_back({"mtp draft vocabulary", vocab});
+#else
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
+#endif
                 }
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
                 if (next_file) next_file();
                 if (!strata::core::session_model_fingerprint(files, fp, e, next_file))
                     return false;
-                model_fp = fp;
+                model_hash = fp;
             }
-            if (!config_fp) {
+            if (!config_hash) {
                 strata::core::SessionConfig c;
                 c.engine_version = STRATA_VERSION;
 #if defined(STRATA_USE_HIP)
@@ -12180,7 +12210,7 @@ int main(int argc, char** argv) {
                 c.kv = o.kv;
                 c.max_context = o.max_context;
                 c.kv_resident = o.kv_resident;
-                c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
+                c.mtp_window = (base || o.mtp.empty()) ? -1 : o.mtp_window;
                 const char* rot = std::getenv("STRATA_KV_ROT");
                 c.kv_rot = rot != nullptr && rot[0] == '1';
                 c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
@@ -12199,10 +12229,10 @@ int main(int argc, char** argv) {
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
-                config_fp = strata::core::session_config_fingerprint(c);
+                config_hash = strata::core::session_config_fingerprint(c);
             }
-            id.model = *model_fp;
-            id.config = *config_fp;
+            id.model = *model_hash;
+            id.config = *config_hash;
             return true;
         };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
@@ -12554,7 +12584,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (history_approximate || !conversations.enabled() || !live_ok || live.empty()) return true;
+            if (draft_warmup_start || history_approximate || !conversations.enabled() || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
@@ -14390,7 +14420,7 @@ int main(int argc, char** argv) {
         };
         auto continuation_supported = [&]() {
 #if defined(STRATA_GPU_METAL)
-            return summary_supported() && strata::metal_engine::window_continuation_supported() &&
+            return (foreground_mtp || (summary_supported() && strata::metal_engine::window_continuation_supported())) &&
                 !pipe && !kvg.on && !o.prefill_head_alias && !ajob &&
                 std::getenv("STRATA_FOLLOW") == nullptr && std::getenv("STRATA_FOLLOW_LOGPOS") == nullptr;
 #else
@@ -15702,6 +15732,7 @@ int main(int argc, char** argv) {
                 std::string id;
                 size_t limit = 0, cursor = 0, produced = 0;
                 int32_t last_token = -1;
+                std::vector<int32_t> drafts;
                 const char* status = "failed";
                 ~AsyncPreparation() {
                     if (!id.empty()) {
@@ -15712,7 +15743,10 @@ int main(int argc, char** argv) {
                 }
             } prep;
             if (line == "APREP_CAPS") {
-                std::printf("APREP_CAPS %d legacy1\n", continuation_supported() ? 1 : 0);
+                if (foreground_mtp && continuation_supported())
+                    std::printf("APREP_CAPS 2 mtp1 %d\n", o.spec);
+                else
+                    std::printf("APREP_CAPS %d legacy1\n", continuation_supported() ? 1 : 0);
                 std::fflush(stdout); continue;
             }
             if (line.rfind("APREP ", 0) == 0) {
@@ -15776,7 +15810,7 @@ int main(int argc, char** argv) {
                         refused("arguments", ae); continue;
                     }
                     aid = incoming.id;
-                    if (!continuation_supported() || summary_tx.active() || nan_flush) {
+                    if (!continuation_supported() || (foreground_mtp && (!mtp_summary || !incoming.summary || arecover)) || summary_tx.active() || nan_flush) {
                         refused("configuration", "continuation unavailable for this configuration"); continue;
                     }
                     auto& c = continuations[incoming.summary ? 1 : 0];
@@ -15891,6 +15925,78 @@ int main(int argc, char** argv) {
                     ~ContinuationBusy() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
                 } continuation_busy;
                 const bool prefill = c.prompt_remaining() != 0;
+                if (foreground_mtp && !prefill && !c.summary) {
+                    const size_t room = std::min({(size_t)o.spec, c.limit - c.produced,
+                        (size_t)o.max_context - c.cursor});
+                    if (!room) { refused("context", "no room for an MTP quantum"); continue; }
+                    const int T = (int)std::min(room, c.pending_drafts.size() + 1);
+                    std::vector<int32_t> window(1, c.ids[c.cursor]);
+                    window.insert(window.end(), c.pending_drafts.begin(), c.pending_drafts.begin() + T - 1);
+                    std::vector<int32_t> out((size_t)T);
+                    c.sampler.counter = (uint64_t)c.cursor;
+                    ver.set_sampling(c.sampler);
+                    if (!ver.set_logit_bias(c.bias, ae)) {
+                        std::printf("FATAL MTP continuation bias reset failed\n"); std::fflush(stdout); return 1;
+                    }
+                    ver.set_head_sampling(true);
+                    const int hist_n = c.sampler.penalty_last_n;
+                    if (hist_n) {
+                        std::vector<int32_t> histories((size_t)T * (size_t)hist_n);
+                        strata::kernels::penalty_rows(c.ids.data() + c.penalty_origin,
+                            (int64_t)(c.cursor - c.penalty_origin), window.data(), T, hist_n, histories.data());
+                        if (cudaMemcpy(d_hist, histories.data(), histories.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                            std::printf("FATAL MTP continuation penalty upload failed\n"); std::fflush(stdout); return 1;
+                        }
+                    }
+                    ver.set_history(hist_n ? d_hist : nullptr, hist_n);
+                    drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
+                    const size_t start = c.cursor;
+                    if (!ver.run(T, window.data(), (int64_t)start, win_pool_fn, win_pool_user, out.data(), ae) ||
+                        drive.d.failed || ver.nonfinite_row() >= 0) {
+                        std::printf("FATAL MTP continuation verification failed\n"); std::fflush(stdout); return 1;
+                    }
+                    auto is_eos = [&](int32_t tok) {
+                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t)tok) != o.eos_ids.end();
+                    };
+                    int count = 1;
+                    while (count < T && !is_eos(out[count - 1]) && out[count - 1] == window[count]) ++count;
+                    if (!ver.commit(count, ae) || !ver.wait_commit(ae)) {
+                        std::printf("FATAL MTP continuation commit failed\n"); std::fflush(stdout); return 1;
+                    }
+                    c.cursor += (size_t)count;
+                    c.produced += (size_t)count;
+                    const bool eos = is_eos(out[count - 1]);
+                    c.done = eos || c.produced == c.limit;
+                    c.pending_drafts.clear();
+                    if (!c.done) {
+                        int n = 0;
+                        std::vector<int32_t> draft((size_t)mtp.max_t());
+                        std::vector<float> probability(draft.size());
+                        const int depth = (int)std::min({(size_t)(mtp.max_t() - 1), (size_t)(o.spec - 1),
+                            (size_t)o.max_context - c.cursor});
+                        mtp.set_max_drafts(depth);
+                        if (!mtp.draft_long(T, out.data(), (int64_t)start, count - 1, draft.data(), ae,
+                                            probability.data(), (float)o.spec_min_p, &n)) {
+                            std::printf("FATAL MTP continuation drafting failed\n"); std::fflush(stdout); return 1;
+                        }
+                        for (int i = 0; i < n && probability[i] >= (float)o.spec_min_p; ++i)
+                            c.pending_drafts.push_back(draft[i]);
+                    } else if (!mtp.prefill(ver.final_R_all(), out.data(), count, (int64_t)start, ae)) {
+                        std::printf("FATAL MTP continuation tail update failed\n"); std::fflush(stdout); return 1;
+                    }
+                    c.ids.insert(c.ids.end(), out.begin(), out.begin() + count);
+                    live.assign(c.ids.begin(), c.ids.begin() + c.cursor); live_ok = c.cache;
+                    for (int i = 0; i < count; ++i) {
+                        std::printf("AT %s %d\n", aid.c_str(), (int)out[i]);
+                        if (c.logprobs >= 0) emit_lp_line(ver, i, out[i], c.logprobs, c.allowed, aid.c_str());
+                        if (c.eos_trace && is_eos(out[i])) emit_lp_line(ver, i, out[i], 5, {}, aid.c_str(), true);
+                    }
+                    std::fprintf(stderr, "strata MTP continuation: accepted=%d offered=%d\n", count - 1, T - 1);
+                    if (c.done) std::printf("ADONE %s %s %llu\n", aid.c_str(), eos ? "stop" : "length", (unsigned long long)c.produced);
+                    else std::printf("AYIELD %s decode %llu %llu\n", aid.c_str(),
+                        (unsigned long long)c.cursor, (unsigned long long)c.produced);
+                    std::fflush(stdout); continue;
+                }
                 const bool serial_recovery = c.id == serial_recovery_id;
                 const size_t end = c.cursor + (serial_recovery && c.prompt_remaining()
                     ? std::min<size_t>(std::clamp<size_t>(summary_inputs, 1, 2048), c.prompt_remaining())
@@ -15951,6 +16057,7 @@ int main(int argc, char** argv) {
                     std::printf("AT %s %d\n", aid.c_str(), (int)next);
                     if (c.logprobs >= 0) emit_lp_line(ver, 0, next, c.logprobs, c.allowed, aid.c_str());
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t)next) != o.eos_ids.end();
+                    if (eos && c.eos_trace) emit_lp_line(ver, 0, next, 5, {}, aid.c_str(), true);
                     c.done = eos || c.produced >= c.limit;
                     if (c.done) std::printf("ADONE %s %s %llu\n", aid.c_str(), eos ? "stop" : "length", (unsigned long long)c.produced);
                 }
@@ -15964,6 +16071,12 @@ int main(int argc, char** argv) {
                 line.rfind("SUMMARY_STATE_BEGIN ", 0) != 0 && line.rfind("SUMMARY_STATE_FORK ", 0) != 0 && line.rfind("SUMMARY_STATE_END ", 0) != 0 &&
                 line != "SUMMARY_STATE_CAPS" && line != "SUMMARY_CLONE_CAPS" && line != "QUIT") {
                 std::printf("ASYNC_REFUSED INVALID busy live continuation owns the session\n"); std::fflush(stdout); continue;
+            }
+            if (mtp_summary && summary_bank.active() && prep.id.empty() &&
+                (line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0)) {
+                std::printf("SERR invalid 0 MTP summary bank requires tagged continuation\n");
+                std::fflush(stdout);
+                continue;
             }
             // An attempted ordinary request may partially write state even if parsing/prefill later
             // fails or is cancelled. Only successful EMPTY rollback may restore pristine provenance.
@@ -15983,7 +16096,7 @@ int main(int argc, char** argv) {
             if (line == "SUMMARY_CLONE_CAPS") {
                 bool capable = false;
 #if defined(STRATA_GPU_METAL)
-                capable = summary_supported() && strata::metal_engine::window_summary_supported();
+                capable = summary_bank_supported() && strata::metal_engine::window_summary_supported();
 #endif
                 uint64_t clone_capacity = (uint64_t)o.max_context;
 #if defined(STRATA_GPU_METAL)
@@ -15998,7 +16111,7 @@ int main(int argc, char** argv) {
             if (line == "SUMMARY_STATE_CAPS") {
                 bool capable = false;
 #if defined(STRATA_GPU_METAL)
-                capable = summary_supported() && strata::metal_engine::window_summary_supported();
+                capable = summary_bank_supported() && strata::metal_engine::window_summary_supported();
 #endif
                 std::printf("SUMMARY_STATE_CAPS %d 16384\n", capable ? 6 : 0);
                 std::fflush(stdout); continue;
@@ -16154,7 +16267,7 @@ int main(int argc, char** argv) {
                 if (!parsed) { refuse_state("invalid transaction arguments"); continue; }
 #if defined(STRATA_GPU_METAL)
                 if (state_begin) {
-                    if (summary_bank.active() || summary_tx.active() || !summary_supported() || nan_flush ||
+                    if (summary_bank.active() || summary_tx.active() || !summary_bank_supported() || nan_flush ||
                         !strata::metal_engine::window_summary_supported() || summary_bank.epoch == UINT64_MAX) {
                         refuse_state("state bank unavailable for this configuration or session"); continue;
                     }
@@ -16299,9 +16412,12 @@ int main(int argc, char** argv) {
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             const bool summary_begin = line.rfind("SUMMARY_BEGIN ", 0) == 0;
             const bool summary_end = line.rfind("SUMMARY_END ", 0) == 0;
-            if (summary_begin || summary_end || line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            const bool restore_base = line.rfind("RESTORE_BASE ", 0) == 0;
+            const bool save_base = line.rfind("SAVE_BASE ", 0) == 0;
+            const bool save_migrated = line.rfind("SAVE_MIGRATED ", 0) == 0;
+            if (save_migrated || save_base || restore_base || summary_begin || summary_end || line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = summary_begin || (!summary_end && line[0] == 'S');
-                std::string path = line.substr(summary_begin ? 14 : summary_end ? 12 : save ? 5 : 8);
+                std::string path = line.substr(save_migrated ? 14 : save_base ? 10 : restore_base ? 13 : summary_begin ? 14 : summary_end ? 12 : save ? 5 : 8);
                 strata::core::SummaryLimits summary_limits;
                 const bool summary_limits_ok = !summary_begin || summary_limits.parse(path);
                 // END temporarily restores configuration for the existing file reader. Any refusal keeps
@@ -16343,7 +16459,38 @@ int main(int argc, char** argv) {
                 // or writes the checkpoints (a join inside the session file writer would match only the copy of a checkpoint)
                 strata::core::conversation_checkpoint_join(nullptr);
                 strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
+                if (save_migrated && (!mtp_history || draft_warmup_start == 0 || history_approximate || !live_imgs.empty())) {
+                    refuse("no migrated text session to save"); continue;
+                }
+                if (save_base && (use_mtp || !stages.empty() || o.batch || history_approximate || !live_imgs.empty() ||
+                                  std::getenv("STRATA_TEST_MTP_HISTORY") == nullptr)) {
+                    refuse("experimental base save requires a text-only single-session engine with MTP disabled"); continue;
+                }
+                auto migration_checkpoint = [&](const auto& chain, const auto& ids) {
+                    const ConvCheckpoint* best = nullptr;
+                    for (const auto& candidate : chain) {
+                        const size_t count = candidate.ids.size();
+                        if (count > 0 && count <= ids.size() && ids.size() - count >= draft_replay_tokens &&
+                            candidate.imgs.empty() && std::equal(candidate.ids.begin(), candidate.ids.end(), ids.begin()) &&
+                            (!best || count > best->ids.size()))
+                            best = &candidate;
+                    }
+                    return best;
+                };
                 if (path.empty()) { refuse("missing path"); continue; }
+#if defined(STRATA_GPU_METAL)
+                if (restore_base && (!mtp_history || !summary_pristine || o.batch || !stages.empty() ||
+                                     o.prompt_cache <= 0 || draft_warmup_start != 0)) {
+                    refuse("experimental base restore requires a pristine single-session Metal MTP engine");
+                    continue;
+                }
+#else
+                if (restore_base) { refuse("base restore requires Metal"); continue; }
+#endif
+                if (draft_warmup_start != 0 && !save_migrated) {
+                    refuse("partial draft cache cannot be written as a complete session"); continue;
+                }
+
                 if (!summary_limits_ok) { refuse("summary v3 needs positive token, snapshot-byte and protected-byte limits plus path"); continue; }
                 if (summary_begin && live.size() > summary_limits.tokens) {
                     refuse("main session exceeds qualified summary token envelope"); continue;
@@ -16533,7 +16680,7 @@ int main(int argc, char** argv) {
                 }
                 strata::core::SessionFileIdentity id;
                 try {
-                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
+                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); }, restore_base || save_migrated)) {
                         refuse(err, strata::core::SessionError::io);
                         continue;
                     }
@@ -16570,7 +16717,7 @@ int main(int argc, char** argv) {
                             sl.state_bytes = state <= UINT64_MAX - positions ? state + positions : UINT64_MAX;
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + (use_mtp ? 1 : 0);
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + (use_mtp && !save_migrated ? 1 : 0);
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim && !summary_begin) {
@@ -16598,7 +16745,14 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why,
+                        if (save_base || save_migrated) {
+                            const auto* ck = migration_checkpoint(checks, live);
+                            if (!ck) { refuse("no checkpoint with a full Metal draft window to replay"); continue; }
+                            if (!admit(strata::core::session_save_peak_bytes(ck, sl), why)) {
+                                refuse(why, strata::core::SessionError::memory); continue;
+                            }
+                            disk_checks.push_back(*ck);
+                        } else if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why,
                             std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS") &&
                             std::string(std::getenv("STRATA_ATOMIC_SUMMARY_CHECKPOINTS")) == "1" ?
                                 (std::getenv("STRATA_ATOMIC_RECENT_CHECKPOINT") &&
@@ -16613,7 +16767,7 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, use_mtp && !save_migrated ? &mtp.kv_state() : nullptr,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -16670,7 +16824,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
+                                limits, ss, g, use_mtp && !restore_base ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -16687,7 +16841,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, use_mtp ? &mtp.kv_state() : nullptr, err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, use_mtp && !restore_base ? &mtp.kv_state() : nullptr, err)) {
                         refuse(err);
                         continue;
                     }
@@ -16695,8 +16849,16 @@ int main(int argc, char** argv) {
                     if (!image.history_positions.empty()) { refuse("approximate history requires Metal"); continue; }
 #endif
                     if (!strata::history::position_map_valid(image.history_positions, image.live.ids, image.live.imgs, 4*o.max_context) ||
-                        (!image.history_positions.empty() && (!o.vision || use_mtp || use_df2 || o.batch || !stages.empty()))) {
+                        (!image.history_positions.empty() && (!o.vision || (use_mtp && !mtp_history) || use_df2 || o.batch || !stages.empty()))) {
                         refuse("unsupported approximate history position map"); continue;
+                    }
+                    const ConvCheckpoint* base_checkpoint = nullptr;
+                    if (restore_base) {
+                        if (!image.live.imgs.empty() || !image.history_positions.empty()) {
+                            refuse("base restore requires a text session with exact positions"); continue;
+                        }
+                        base_checkpoint = migration_checkpoint(image.checkpoints, image.live.ids);
+                        if (!base_checkpoint) { refuse("no checkpoint with a full Metal draft window to replay"); continue; }
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
@@ -16707,7 +16869,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, use_mtp ? &mtp.kv_state() : nullptr, err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, use_mtp && !restore_base ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -16717,6 +16879,9 @@ int main(int argc, char** argv) {
                                     err.c_str());
                         std::fflush(stdout);
                         return 1;
+                    }
+                    if (base_checkpoint && !checkpoint_restore(*base_checkpoint, ss, g)) {
+                        std::printf("FATAL restoring the base checkpoint failed\n"); std::fflush(stdout); return 1;
                     }
                     history_approximate = !image.history_positions.empty();
                     if (history_approximate) {
@@ -16736,6 +16901,15 @@ int main(int argc, char** argv) {
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+                    if (base_checkpoint) {
+                        draft_warmup_start = base_checkpoint->ids.size();
+                        live.resize(draft_warmup_start);
+                        // Keep the validated earlier checkpoint so a subsequent save
+                        // can persist base state again without exporting partial draft K/V.
+                        checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+                            return c.ids.size() != draft_warmup_start;
+                        }), checks.end());
+                    }
                     cvec_cached = image.cvec;
                     live_ok = true;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
@@ -16751,7 +16925,7 @@ int main(int argc, char** argv) {
                     if (summary_end) {
                         if (!summary_release()) return 1;
                         std::printf("SUMMARY_RELEASED %zu %zu %.1f\n", live.size(), bytes, ms());
-                    } else std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    } else std::printf("%s %zu %zu %.1f\n", restore_base ? "BASE_RESTORED" : "RESTORED", live.size(), bytes, ms());
                 }
                 std::fflush(stdout);
                 continue;
@@ -16779,6 +16953,7 @@ int main(int argc, char** argv) {
             // logprobs=K (0..20): after each "T id" an "LP logprob id:logprob ..." line.
             // -1 (absent) = no LP lines, so a server that never asks sees today's output.
             int req_logprobs = -1;
+            bool req_eos_trace = false;
             // allowed=a,b,c: with logprobs, print only these token ids (renormalized server-side).
             std::vector<int32_t> req_allowed;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
@@ -16831,6 +17006,7 @@ int main(int argc, char** argv) {
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "eos_trace") req_eos_trace = fv == 1.0f;
                     else if (key == "allowed") {
                         const std::string csv = tok.substr(eq + 1);
                         size_t p = 0;
@@ -17196,8 +17372,8 @@ int main(int argc, char** argv) {
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
 #if defined(STRATA_GPU_METAL)
-            if (req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && live_ok && !nan_flush &&
-                stages.empty() && o.batch == 0 && !use_mtp && !use_df2 && o.vision &&
+            if (!draft_warmup_start && req_history && req_history != history_last_hash && !summary_tx.active() && !continuation_summary_selected && (!use_mtp || !geni) && live_ok && !nan_flush &&
+                stages.empty() && o.batch == 0 && (!use_mtp || mtp_history) && !use_df2 && o.vision &&
                 want_cvec == cvec_cached && o.prompt_cache > 0 && !starts_with(live, live_imgs)) {
                 const auto plan = strata::history::match(live, ids, int32_t(o.turn_token), kImagePad);
                 if (plan.length && strata::history::images_discarded(live, live_imgs, plan, kImagePad)) {
@@ -17248,6 +17424,15 @@ int main(int argc, char** argv) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+            }
+            if (draft_warmup_start != 0 && !continuation_summary_selected &&
+                size_t(n - 1) - std::min(size_t(n - 1), draft_warmup_start) < draft_replay_tokens) {
+                // A different or much shorter request may share the checkpoint's prefix
+                // but cannot rebuild all cells the first draft window will read.
+                resume = 0;
+                from_live = false;
+                live_ok = false;
+                checks.clear();
             }
             // STRATA_SLOT_CKPT_MOVE: a turn checkpoint a batch admission moved into its slot is still one of the main
             // session's while the main session holds its tokens (the cells below it are the ones it was taken over):
@@ -17793,6 +17978,7 @@ int main(int argc, char** argv) {
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
+                if (!continuation_summary_selected) draft_warmup_start = 0;
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
@@ -20487,6 +20673,7 @@ int main(int argc, char** argv) {
                     if (sfx_on) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    if (eos && req_eos_trace) emit_lp_line(ver, i, outv[(size_t) i], 5, {}, nullptr, true);
                 }
                 std::fflush(stdout);
                 ++rounds;
@@ -20507,9 +20694,12 @@ int main(int argc, char** argv) {
                 }
 #endif
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                const bool drafted = !draft_on || eos || produced_n >= max_new ||
+                const bool keep_prepared_draft = foreground_mtp && !prep.id.empty() && prep.limit > 1 &&
+                    !eos;
+                int prepared_count = 0;
+                const bool drafted = !draft_on || eos || (produced_n >= max_new && !keep_prepared_draft) ||
                                      (req_df2 ? ((!merged && defer_df2(a)) || draft_df2(a)) : mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
-                                                                               nullptr, gated_proposal ? &generation : nullptr));
+                                                                               keep_prepared_draft ? &prepared_count : nullptr, gated_proposal ? &generation : nullptr));
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -20554,6 +20744,9 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (keep_prepared_draft)
+                    for (int i = 0; i < prepared_count && dprob[i] >= (float)req_spec_min_p; ++i)
+                        prep.drafts.push_back(drafts[i]);
                 if (gated_proposal && !eos && !initial_round)
                     source_policy.observe_committed(from_sfx, from_sfx ? T : std::min<int>(S_mtp, (int) std::min<int64_t>(S, o.max_context - p)),
                                                     a, sfx_match);
@@ -20811,7 +21004,8 @@ int main(int argc, char** argv) {
                     c.ids = live; c.ids.push_back(prep.last_token);
                     c.sampler = req_sp; c.sampler.counter = (uint64_t)c.cursor; c.sampler.logit_bias = nullptr;
                     c.bias = req_bias; c.penalty_origin = pen_gen0; c.cache = req_ckpt != 0;
-                    c.logprobs = req_logprobs; c.allowed = req_allowed;
+                    c.logprobs = req_logprobs; c.allowed = req_allowed; c.eos_trace = req_eos_trace;
+                    c.pending_drafts = std::move(prep.drafts);
                     c.done = std::strcmp(finish, "stop") == 0 || prep.limit == 1;
                     prep.status = c.done ? (std::strcmp(finish, "stop") == 0 ? "stop" : "length") : "active";
                     continuations[0] = std::move(c);

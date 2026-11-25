@@ -299,6 +299,7 @@ public:
                    float min_p, int* n_drafts, std::string& err);
     bool mtp_loaded() const { return mtp_on_; }
     bool prepare_shared_resources(std::string& err);
+    const std::string& mtp_vocab_file() const { return mtp_vocab_file_; }
     // ---- DFlash2 (dflash2.inc): the taps of the tapped layers and the drafter
     bool taps_enable(const std::vector<int>& layers, std::string& err);
     void taps_set_cb(int64_t first_pos, const std::function<bool(const float*, int64_t, int64_t, std::string&)>& cb) { tap_first_ = first_pos; tap_cb_ = cb; }
@@ -639,6 +640,7 @@ private:
     mtl::Buffer mhead_;
     gguf::Tensor mhead_t_;
     std::vector<int32_t> dvocab_;
+    std::string mtp_vocab_file_;
     // the draft layer's BF16 matrices in Q8_0 (half the bytes a draft step reads; drafts only: the verify window
     // decides every token).  STRATA_METAL_MTP_Q8=0 keeps BF16.
     mtl::Buffer mq8_;
@@ -2140,7 +2142,9 @@ bool Window::summary_supported() const {
     for (const char* key : {"STRATA_METAL_LOGPOS", "STRATA_LOGPOS", "STRATA_METAL_SKIP",
                             "STRATA_METAL_KPROF", "STRATA_METAL_STEPPROF", "STRATA_METAL_STAGE_PROFILE", "STRATA_PROMPT_KPROF", "STRATA_METAL_STREAM_FAKE"})
         if (std::getenv(key)) return false;
-    return ready() && (!stream_ || st_ != nullptr) && !mtp_on_ && !df2_ && !taps_on_ && sets_.empty() &&
+    return ready() && (!stream_ || st_ != nullptr) &&
+           (!mtp_on_ || (std::getenv("STRATA_TEST_FOREGROUND_MTP") && std::getenv("STRATA_TEST_MTP_SUMMARY"))) &&
+           !df2_ && !taps_on_ && sets_.empty() &&
            !bigs_ok_ && gst_.size() == 36 && kq_.size() == 12 && allocation_max_cells_ >= 16384;
 }
 bool Window::continuation_supported() const {
@@ -2538,7 +2542,8 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
 }
 
 bool Window::history_compact(int64_t prefix, int64_t source, int64_t length, std::string& err) {
-    if (!ready() || mtp_on_ || n_slots() || summary_is_selected() || prefix <= 0 || source <= prefix ||
+    if (!ready() || (mtp_on_ && !std::getenv("STRATA_TEST_MTP_HISTORY")) ||
+        n_slots() || summary_is_selected() || prefix <= 0 || source <= prefix ||
         length < 512 || prefix % 4 || source % 4 || length % 4 || source > max_cells_ - length) {
         err = "history cache: unsupported state or unaligned indexer boundary"; return false;
     }
@@ -2550,6 +2555,18 @@ bool Window::history_compact(int64_t prefix, int64_t source, int64_t length, std
         if (!pooled_[j].ptr || !strata::history::rows_fit(pooled_[j].bytes,512,prefix/4,source/4,length/4)) {
             err = "history cache: indexer extent mismatch"; return false;
         }
+    }
+    if (mtp_on_) {
+        for (const auto& item : {std::pair<const mtl::Buffer*, size_t>{&mkq_[0], G_QKV * G_QD},
+                 {&mvq_[0], G_QKV * G_QD}, {&mksc_[0], 8 * G_QKV}, {&mvsc_[0], 8 * G_QKV}}) {
+            if (!item.first->ptr || !strata::history::rows_fit(item.first->bytes, item.second, prefix, source, length)) {
+                err = "history cache: MTP KV extent mismatch"; return false;
+            }
+        }
+        if (!mpooled_[0].ptr || !strata::history::rows_fit(mpooled_[0].bytes, 4 * G_ID, prefix/4, source/4, length/4)) {
+            err = "history cache: MTP indexer extent mismatch"; return false;
+        }
+        mtp_wait();
     }
     // checkpoint_save settles the delayed recurrent fold before positional bytes move.
     if (pend_fold_ > 0) {
@@ -2564,6 +2581,12 @@ bool Window::history_compact(int64_t prefix, int64_t source, int64_t length, std
         strata::history::compact_rows(pooled_[j].ptr,pooled_[j].bytes,512,prefix/4,source/4,length/4);
         std::memset(tail_[j].ptr, 0, 4 * 4 * 128);
         // dead_ is the first token's key; the unchanged fixed prefix preserves it.
+    }
+    if (mtp_on_) {
+        move(mkq_[0], G_QKV * G_QD); move(mvq_[0], G_QKV * G_QD);
+        move(mksc_[0], 8 * G_QKV); move(mvsc_[0], 8 * G_QKV);
+        strata::history::compact_rows(mpooled_[0].ptr, mpooled_[0].bytes, 4 * G_ID, prefix/4, source/4, length/4);
+        std::memset(mtail_[0].ptr, 0, TAIL_B);
     }
     // GDN/PLE intentionally retain the removed history's influence: approximate, never exact replay.
     last_T_ = 0; last_head_ = false;
@@ -2733,6 +2756,7 @@ bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err)
         else vp = strata_metal::resource(nullptr, "data", STRATA_METAL_DATA_DEFAULT) + "/draft_vocab.bin";
         FILE* f = vp == "full" ? nullptr : std::fopen(vp.c_str(), "rb");
         if (f) {
+            mtp_vocab_file_ = vp;
             int32_t id;
             while (std::fread(&id, 4, 1, f) == 1) if (id >= 0 && id < n_vocab_) dvocab_.push_back(id);
             std::fclose(f);
@@ -3919,6 +3943,8 @@ void mtp_bind_state(strata::core::QsaState& st) {
     g_draft_state = &st;
     if (g_the_window && g_the_window->mtp_ready()) g_the_window->bind_draft(st);
 }
+std::string mtp_model_file() { return g_mtp_path; }
+std::string mtp_vocab_file() { return g_the_window ? g_the_window->mtp_vocab_file() : std::string(); }
 bool mtp_load_pending(Window* w, std::string& err) {
     return g_mtp_path.empty() || w->mtp_load(g_mtp_path, g_mtp_max_t, err);
 }

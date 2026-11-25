@@ -23,6 +23,7 @@ class ContinuationClient:
         self.generation = engine.gen
         self.idle_summary_inputs = False
         self.summary_max_inputs = 1
+        self.foreground_decode_max = 1
 
     def poison(self, reason):
         self.scheduler.poison(reason)
@@ -80,7 +81,7 @@ class ContinuationClient:
                                   (len(fields) == 4 and fields[0] == "ADONE")):
                 return fields
             if not admission and ((len(fields) == 3 and fields[0] == "AT") or
-                                  (len(fields) >= 3 and fields[0] == "ALP")):
+                                  (len(fields) >= 3 and fields[0] in ("ALP", "AEOSLP"))):
                 continue
             if admission and len(fields) >= 4 and fields[0] == "ASYNC_REFUSED":
                 return fields
@@ -103,10 +104,18 @@ class ContinuationClient:
             self.idle_summary_inputs = capabilities != self.CAPS
             self.summary_max_inputs = int(capabilities[3])
             self.engine._send_for(self.generation, "APREP_CAPS")
-            if self._sync_read() != self.PREP_CAPS:
+            prep = self._sync_read()
+            if prep == self.PREP_CAPS:
+                self.foreground_decode_max = 1
+            elif len(prep) == 4 and prep[:3] == ["APREP_CAPS", "2", "mtp1"]:
+                self.foreground_decode_max = self._number(prep[3], 64)
+                if self.foreground_decode_max < 2:
+                    raise ValueError("invalid MTP continuation decode width")
+            else:
                 raise ValueError("native legacy-preparation continuation protocol unavailable")
             if self.idle_summary_inputs:
-                print("[strata] summary input quanta: idle=native-max, foreground-pending=1, scheduled-foreground=512, decode=1", flush=True)
+                print("[strata] summary input quanta: idle=native-max, foreground-pending=1, scheduled-foreground=512, "
+                      f"foreground-decode={self.foreground_decode_max}", flush=True)
 
     def _sampling_keys(self, sampling):
         keys = self.engine.sampling_keys(sampling or {}).strip().split()
@@ -173,6 +182,8 @@ class ContinuationClient:
                     raise self.poison(str(exc)) from exc
             elif fields[:1] == ["LP"] and result["tokens"]:
                 result["logprobs"].append((result["tokens"][-1], line))
+            elif fields[:1] == ["EOSLP"] and result["tokens"]:
+                result["eos_trace"] = (result["tokens"][-1], line.strip())
             elif fields[:1] == ["DONE"]:
                 try:
                     self.engine._parse_done(line)
@@ -213,8 +224,12 @@ class ContinuationClient:
             raise ValueError("weighted summary continuation requires text generation")
         if type(max_new) is not int or max_new < 1 or not ids:
             raise ValueError("invalid native continuation request")
+        quantum_limit = 1 if owner.summary else self.foreground_decode_max
         keys = self._sampling_keys(sampling) if owner.summary else self.engine.sampling_keys(sampling or {}).strip()
         want_lp = top_logprobs(sampling or {}) is not None
+        eos_trace_ids = (sampling or {}).get("_eos_trace_ids", ()) if not (owner.summary or want_lp) else ()
+        if eos_trace_ids:
+            cancel._strata_eos_trace = None
         if want_lp:
             cancel._strata_lp_lines = LPLines(cancel)
         identity = uuid.uuid4().hex
@@ -358,6 +373,9 @@ class ContinuationClient:
                         raise self.poison("unexpected first-token logprobs")
                     for item in preparation["logprobs"]:
                         cancel._strata_lp_lines.append(item)
+                scores = preparation.get("eos_trace")
+                if scores and scores[0] in eos_trace_ids:
+                    cancel._strata_eos_trace = scores
                 for token in preparation["tokens"]:
                     emitted.append(token)
                     yield token
@@ -385,14 +403,19 @@ class ContinuationClient:
                                     token = self._number(fields[2], (1 << 31) - 1)
                                 except ValueError as exc:
                                     raise self.poison(str(exc)) from exc
-                                if output:
-                                    raise self.poison("native decode quantum emitted more than one token")
+                                if len(output) >= min(quantum_limit, max_new - produced):
+                                    raise self.poison("native decode quantum exceeded its negotiated token limit")
                                 output.append(token)
                                 continue
+                            if len(fields) >= 3 and fields[0] == "AEOSLP":
+                                if not output or output[-1] not in eos_trace_ids:
+                                    raise self.poison("unexpected EOS trace")
+                                cancel._strata_eos_trace = (output[-1], "EOSLP " + " ".join(fields[2:]))
+                                continue
                             if len(fields) >= 3 and fields[0] == "ALP":
-                                if not want_lp or len(output) != 1:
+                                if not want_lp or not output:
                                     raise self.poison("unexpected continuation logprobs")
-                                cancel._strata_lp_lines.append((output[0], "LP " + " ".join(fields[2:]) + "\n"))
+                                cancel._strata_lp_lines.append((output[-1], "LP " + " ".join(fields[2:]) + "\n"))
                                 continue
                             if len(fields) == 5 and fields[0] == "AYIELD" and fields[2] in ("prefill", "decode"):
                                 try:

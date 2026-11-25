@@ -308,3 +308,42 @@ class ConcurrentProtocolTests(unittest.TestCase):
         self.assertEqual(sorted((summary,len(tokens)) for summary,tokens in outcomes),[(False,64),(True,8)])
 
 if __name__ == '__main__': unittest.main()
+
+
+class MtpContinuationTests(unittest.TestCase):
+    def check_quantum(self, caps, width, should_accept):
+        case = ClientTests()
+        case.setUp()
+        original = case.e._send_for
+
+        def send(generation, command):
+            kind = command.split()[0]
+            if kind == "APREP_CAPS":
+                case.e.lines.put(caps)
+            elif kind == "ANEXT":
+                identity = command.split()[1]
+                for i in range(width):
+                    case.e.lines.put(f"AT {identity} {102 + i}")
+                case.e.lines.put(f"ADONE {identity} length {width + 1}")
+            else:
+                original(generation, command)
+
+        case.e._send_for = send
+        case.client.discover()
+        result = case.client.generate([1, 2, 3], width + 1, {}, case.cancel)
+        if should_accept:
+            self.assertEqual(list(result), list(range(101, 102 + width)))
+            self.assertFalse(case.lane.poisoned)
+        else:
+            with self.assertRaises(PriorityError):
+                list(result)
+            self.assertTrue(case.lane.poisoned)
+
+    def test_accepts_mtp_tokens_up_to_negotiated_limit(self):
+        self.check_quantum("APREP_CAPS 2 mtp1 4", 4, True)
+
+    def test_rejects_extra_tokens_from_legacy_engine(self):
+        self.check_quantum("APREP_CAPS 1 legacy1", 2, False)
+
+    def test_rejects_tokens_past_mtp_limit(self):
+        self.check_quantum("APREP_CAPS 2 mtp1 2", 3, False)
