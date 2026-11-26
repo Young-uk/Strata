@@ -4880,6 +4880,7 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.priority_recovery_lock = threading.Lock()
         self.summary_lane = atomic_summary.SummaryLane()
         self.atomic_model_fingerprint = None
         self.atomic_completion_review_qualified = False
@@ -5435,6 +5436,31 @@ class Service:
                              "the engine is not started again (the last: " + why[:160] + "). Check the graphics driver, the "
                              "card's temperature and power, and the log; a request after "
                              f"{self.FATAL_GPU_WINDOW_S / 60:g} minutes tries again")
+
+    def recover_priority_runtime(self):
+        """Rebuild a failed continuation runtime before admitting another request."""
+        recovery = getattr(self, "priority_recovery", None)
+        if recovery is None:
+            return
+        with self.priority_recovery_lock:
+            lane = self.summary_lane
+            scheduler = lane.scheduler
+            if scheduler is None or (self.loaded() and not lane.poisoned and not scheduler.poison_reason):
+                return
+            scheduler.poison("priority runtime recovery pending")
+            with lane.lock:
+                if lane.foreground or lane.summary_registered or lane.active is not None:
+                    raise atomic_summary.SummaryError("previous engine request is winding down",
+                                                      code="atomic_summary_recovery_required")
+                lane.poisoned = True
+            with self.fifo:
+                print("[strata] restarting failed priority runtime before the next request", flush=True)
+                self.engine.restart()
+                restore, configure = recovery
+                restore()
+                self.engine.priority_client = None
+                self.summary_lane = atomic_summary.SummaryLane()
+                configure()
 
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
@@ -6476,6 +6502,8 @@ class Service:
                                 yield from run_auxiliary_agent(self, ids, max_new, sampling, cancel)
                             else:
                                 yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
+                    except priority.PriorityError as exc:
+                        raise EngineDied(str(exc)) from exc
                     finally:
                         scheduler.close(owner)
                         with self.status_lock:
@@ -8709,6 +8737,8 @@ def make_handler(svc: Service):
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    if req.get("atomic_summary") is not True:
+                        svc.recover_priority_runtime()
                     svc.summary_lane.check_healthy()
                     if req.get("atomic_summary") is not True:
                         svc.summary_lane.foreground_arrived()
@@ -10980,7 +11010,25 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         except (OSError, ValueError, TypeError):
             # No stable archive scope is safer than silently trusting an alias.
             svc.atomic_model_fingerprint = None
-    disk_session = None
+    disk_session = base_source = None
+    def restore_disk_runtime():
+        if disk_session is None:
+            return
+        try:
+            restored = disk_session.restore(svc.engine)
+            if restored is None and base_source is not None:
+                try:
+                    restored = base_source.restore_mtp_base(svc.engine)
+                except SessionRefused as exc:
+                    if exc.published:
+                        raise
+                    print(f"[strata] MTP base checkpoint refused ({exc.kind}); starting cold", flush=True)
+            if restored is None:
+                print("[strata] disk session: no compatible saved session (cold start)", flush=True)
+        except Exception as exc:
+            print(f"[strata] disk session restore failed ({type(exc).__name__}); starting cold", flush=True)
+            # A failed device transfer may have changed native state or ended the pipe.
+            svc.engine.restart()
     if a.engine == "strata" and cfg.get("atomic_disk_session_dir"):
         from serve.disk_session import DiskSession
         try:
@@ -10999,60 +11047,50 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 previous_backend_sha256=cfg.get("atomic_disk_session_previous_backend_sha256"),
                 reviewed_upgrades=cfg.get("atomic_disk_session_reviewed_upgrades"),
                 save_migration_checkpoint=bridge is True and not mtp_active)
-            try:
-                restored = disk_session.restore(svc.engine)
-                if restored is None and base_source is not None:
-                    try:
-                        restored = base_source.restore_mtp_base(svc.engine)
-                    except SessionRefused as exc:
-                        if exc.published:
-                            raise
-                        print(f"[strata] MTP base checkpoint refused ({exc.kind}); starting cold", flush=True)
-                if restored is None:
-                    print("[strata] disk session: no compatible saved session (cold start)", flush=True)
-            except Exception as exc:
-                print(f"[strata] disk session restore failed ({type(exc).__name__}); starting cold", flush=True)
-                # A failed device transfer may have changed native state or ended the pipe.
-                svc.engine.restart()
+            restore_disk_runtime()
         except Exception as exc:
             disk_session = None
             print(f"[strata] disk sessions unavailable ({type(exc).__name__})", flush=True)
     # Completion review is independent of automatic-compaction preferences,
     # but uses the same proven isolated lane. Neither flag enables the other.
-    svc.atomic_completion_review_qualified = cfg.get("atomic_completion_review_qualified") is True
-    if a.engine == "strata":
-        summary_enabled = atomic_summary.configure_optional_lane(
-            svc.summary_lane, svc.engine, cfg,
-            engine_name=a.engine, arch=svc.model_arch, groups=groups)
-        if (cfg.get("atomic_summary_clone_enabled") is True and summary_enabled
-            and cfg.get("atomic_summary_scheduler") == "weighted-quanta-v1"):
-            try:
-                svc.engine.summary_state("clone_caps")
-                svc.summary_lane.clone_enabled = True
-                svc.engine.summary_checkpoint_enabled = (cfg.get("atomic_summary_checkpoint_enabled") is True
-                    and svc.engine.info.get("summary_checkpoint") == 1)
-            except Exception:
-                svc.summary_lane.clone_enabled = False
-                print("[strata] cached conversation summaries unavailable; legacy summaries retained", flush=True)
-        if cfg.get("atomic_summary_scheduler") is not None:
-            try:
-                if not summary_enabled or svc.summary_lane.mode != "state-bank-v1" or cfg["atomic_summary_scheduler"] != "weighted-quanta-v1":
-                    raise ValueError("unsupported priority summary configuration")
-                scheduler = priority.WeightedScheduler(svc.fifo, cfg.get("atomic_summary_foreground_weight", 8))
-                client = ContinuationClient(svc.engine, scheduler, svc.summary_lane)
-                client.discover()
-                svc.summary_lane.scheduler = scheduler
-                svc.engine.priority_client = client
-            except Exception as exc:
-                # Never fall back to cancel/restart semantics under a request
-                # for resumable priority scheduling.
-                summary_enabled = svc.summary_lane.enabled = False
-                svc.summary_lane.disabled_reason = "priority_protocol_unavailable: " + type(exc).__name__
-        if (cfg.get("atomic_summary_transaction_qualified") is True or cfg.get("atomic_summary_state_bank_enabled") is True) and not summary_enabled:
+    def configure_summary_runtime():
+        svc.atomic_completion_review_qualified = cfg.get("atomic_completion_review_qualified") is True
+        if a.engine == "strata":
+            summary_enabled = atomic_summary.configure_optional_lane(
+                svc.summary_lane, svc.engine, cfg,
+                engine_name=a.engine, arch=svc.model_arch, groups=groups)
+            if (cfg.get("atomic_summary_clone_enabled") is True and summary_enabled
+                and cfg.get("atomic_summary_scheduler") == "weighted-quanta-v1"):
+                try:
+                    svc.engine.summary_state("clone_caps")
+                    svc.summary_lane.clone_enabled = True
+                    svc.engine.summary_checkpoint_enabled = (cfg.get("atomic_summary_checkpoint_enabled") is True
+                        and svc.engine.info.get("summary_checkpoint") == 1)
+                except Exception:
+                    svc.summary_lane.clone_enabled = False
+                    print("[strata] cached conversation summaries unavailable; legacy summaries retained", flush=True)
+            if cfg.get("atomic_summary_scheduler") is not None:
+                try:
+                    if not summary_enabled or svc.summary_lane.mode != "state-bank-v1" or cfg["atomic_summary_scheduler"] != "weighted-quanta-v1":
+                        raise ValueError("unsupported priority summary configuration")
+                    scheduler = priority.WeightedScheduler(svc.fifo, cfg.get("atomic_summary_foreground_weight", 8))
+                    client = ContinuationClient(svc.engine, scheduler, svc.summary_lane)
+                    client.discover()
+                    svc.summary_lane.scheduler = scheduler
+                    svc.engine.priority_client = client
+                except Exception as exc:
+                    # Never fall back to cancel/restart semantics under a request
+                    # for resumable priority scheduling.
+                    summary_enabled = svc.summary_lane.enabled = False
+                    svc.summary_lane.disabled_reason = "priority_protocol_unavailable: " + type(exc).__name__
+            if (cfg.get("atomic_summary_transaction_qualified") is True or cfg.get("atomic_summary_state_bank_enabled") is True) and not summary_enabled:
+                svc.atomic_completion_review_qualified = False
+                print("[strata] optional summaries disabled: " + str(svc.summary_lane.disabled_reason), flush=True)
+        else:
             svc.atomic_completion_review_qualified = False
-            print("[strata] optional summaries disabled: " + str(svc.summary_lane.disabled_reason), flush=True)
-    else:
-        svc.atomic_completion_review_qualified = False
+    configure_summary_runtime()
+    if cfg.get("atomic_priority_restart_on_failure") is True:
+        svc.priority_recovery = (restore_disk_runtime, configure_summary_runtime)
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
