@@ -228,6 +228,8 @@ ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a think
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
+# A dangling separator or a severed Korean word after a comma.
+RECOVERED_ANSWER_FRAGMENT = re.compile(r"[,，:：]$|[,，]\s+[가-힣]$")
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -6582,6 +6584,7 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        answer_retried, recovered_answer_tail = False, ""
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
@@ -6782,6 +6785,7 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
+                        stop_token_id = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
@@ -6836,6 +6840,8 @@ class Service:
                                         if first_content_token is None and ev.text:
                                             first_content_token = len(raw_ids)
                                         answer_chars += len((ev.text or "").strip())
+                                        if close_retried and not answer_retried:
+                                            recovered_answer_tail = (recovered_answer_tail + (ev.text or ""))[-160:]
                                     elif ev.kind in ("tool_start", "tool_call"):
                                         emitted_tool = True
                                     if ev.kind in ("content", "tool_start", "tool_call"):
@@ -6976,6 +6982,18 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if (close_retried and not answer_retried and finish == "stop" and stop_token_id is not None
+                                and not emitted_tool and force is None and parser.state == "content"
+                                and parser.clean and not detok.pending() and not cancel.is_set()
+                                and (stops is None or stops.hit is None) and n < max_new
+                                and RECOVERED_ANSWER_FRAGMENT.search(recovered_answer_tail.rstrip())):
+                            # Resume from the exact output prefix. The stop token was never added to seg.
+                            answer_retried = True
+                            prompt = prompt + seg
+                            finish = "length"
+                            print(f"[strata] request={request_id} recovered answer ended on token {stop_token_id} "
+                                  "with an incomplete clause; continuing once", flush=True)
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -7153,11 +7171,12 @@ class Service:
             if ev.kind in ("content", "tool_start", "tool_call"):
                 answered = True
             yield "event", ev
-        if thinking and raw_ids and not emitted_tool and answer_chars <= 32:
+        if thinking and raw_ids and not emitted_tool and (answer_chars <= 32 or close_retried):
             stop_source = ("token" if stop_token_id is not None else
                            "sequence" if stops is not None and stops.hit is not None else
                            "engine" if finish == "stop" else finish)
-            print(f"[strata] thinking ended with short or empty answer: request={request_id} finish={finish} "
+            label = "thinking recovery finished" if close_retried else "thinking ended with short or empty answer"
+            print(f"[strata] {label}: request={request_id} finish={finish} "
                   f"stop_source={stop_source} last_token_id={raw_ids[-1]} "
                   f"stop_token_id={stop_token_id} parser_state={parser.state} answer_chars={answer_chars} "
                   f"first_content_token={first_content_token} tail_token_ids={raw_ids[-8:]}", flush=True)

@@ -4257,6 +4257,51 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertIn("two plus two is four", c["message"]["reasoning_content"])
         self.assertEqual(c["finish_reason"], "stop")
 
+    def test_recovered_answer_continues_after_a_mid_word_stop_in_the_same_stream(self):
+        self.svc.reasoning_close_retry = True
+        prefix = "확률이 제일 높고, 기"
+        suffix = "온은 10도예요."
+        engine_generate = self.engine.generate
+
+        def generate(ids, max_new, sampling, cancel, embeddings=None):
+            prompt = self.tok.decode(ids)
+            if prompt.endswith(prefix):
+                self.engine.prompts.append(list(ids))
+                yield from self.tok.encode(suffix) + self.tok.encode("<|im_end|>", parse_special=True)
+            else:
+                yield from engine_generate(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.ANSWER = prefix
+        self.engine.generate = generate
+        body = {"model": "m", "messages": [{"role": "user", "content": "Weather?"}],
+                "max_tokens": 300, "stream": True}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            events = [line[6:].strip().decode() for line in response if line.startswith(b"data: ")]
+        choices = [choice for event in events if event != "[DONE]"
+                   for choice in json.loads(event)["choices"]]
+        self.assertEqual(len(self.engine.prompts), 3)
+        self.assertEqual("".join(choice["delta"].get("content") or "" for choice in choices), prefix + suffix)
+        self.assertEqual([choice["finish_reason"] for choice in choices if choice["finish_reason"]], ["stop"])
+        self.assertEqual(events.count("[DONE]"), 1)
+
+    def test_recovered_answer_is_only_retried_once(self):
+        self.svc.reasoning_close_retry = True
+        self.engine.ANSWER = "확률이 제일 높고, 기"
+        self.engine.THOUGHT = "온을 보면,"
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 3)
+        self.assertEqual(c["message"]["content"], self.engine.ANSWER + self.engine.THOUGHT)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_a_mid_word_stop_without_thinking_recovery_is_not_touched(self):
+        self.svc.reasoning_close_retry = True
+        self.engine.THOUGHT = "ok</think>\n\n확률이 제일 높고, 기"
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["message"]["content"], "확률이 제일 높고, 기")
+
     def test_a_reply_that_answered_is_not_touched(self):
         self.svc.reasoning_close_retry = True
         self.engine.THOUGHT = "ok</think>" + chr(10) + chr(10) + "Fine."

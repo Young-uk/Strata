@@ -48,6 +48,11 @@ def request(req, *, count=False):
         raise ValueError("atomic_summary_recovery must be a boolean")
     if "atomic_auxiliary" in req and type(req["atomic_auxiliary"]) is not bool:
         raise ValueError("atomic_auxiliary must be a boolean")
+    if "atomic_auxiliary_agent" in req:
+        from serve.auxiliary_agent import validate
+        if req.get("atomic_auxiliary") is not True or req.get("stream") is True:
+            raise ValueError("review agents require non-streaming isolated auxiliary requests")
+        validate(req["atomic_auxiliary_agent"])
     if req.get("tools") or req.get("strata_mcp") or (req.get("response_format") and req.get("atomic_auxiliary") is not True):
         raise ValueError("summary requests are text-only, without tools or response_format")
     messages = req.get("messages")
@@ -200,7 +205,7 @@ def qualified_runtime_pins(cfg):
     exe = ((cwd / exe) if not exe.is_absolute() else exe).resolve()
     here = Path(__file__).resolve().parent
     source_hashes = {name: _stable_file_sha(str(here / name), _file_identity(here / name))
-                     for name in ("server.py", "atomic_summary.py", "priority.py", "priority_client.py", "disk_session.py", "history_plan.py", "prompt_trace.py")}
+                     for name in ("server.py", "atomic_summary.py", "priority.py", "priority_client.py", "disk_session.py", "history_plan.py", "prompt_trace.py", "auxiliary_agent.py") if (here / name).is_file()}
     return dict(zip(QUALIFICATION_PIN_KEYS, (
         _stable_file_sha(str(exe), _file_identity(exe)),
         model_fingerprint(cfg),
