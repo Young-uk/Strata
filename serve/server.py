@@ -229,6 +229,8 @@ ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a think
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 # A dangling separator or a severed Korean word after a comma.
+# An unfinished Korean predicate can also follow a naturally closed thought.
+ANSWER_PREDICATE_FRAGMENT = re.compile(r"\S+[이가은는]\s+(?:있|없)$")
 RECOVERED_ANSWER_FRAGMENT = re.compile(r"[,，:：]$|[,，]\s+[가-힣]$")
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
@@ -6584,7 +6586,7 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
-        answer_retried, recovered_answer_tail = False, ""
+        answer_retried, answer_tail = False, ""
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
@@ -6840,8 +6842,8 @@ class Service:
                                         if first_content_token is None and ev.text:
                                             first_content_token = len(raw_ids)
                                         answer_chars += len((ev.text or "").strip())
-                                        if close_retried and not answer_retried:
-                                            recovered_answer_tail = (recovered_answer_tail + (ev.text or ""))[-160:]
+                                        if thinking and self.reasoning_close_retry and not answer_retried:
+                                            answer_tail = (answer_tail + (ev.text or ""))[-160:]
                                     elif ev.kind in ("tool_start", "tool_call"):
                                         emitted_tool = True
                                     if ev.kind in ("content", "tool_start", "tool_call"):
@@ -6982,16 +6984,17 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
-                        if (close_retried and not answer_retried and finish == "stop" and stop_token_id is not None
+                        if (thinking and self.reasoning_close_retry and not answer_retried and finish == "stop" and stop_token_id is not None
                                 and not emitted_tool and force is None and parser.state == "content"
                                 and parser.clean and not detok.pending() and not cancel.is_set()
                                 and (stops is None or stops.hit is None) and n < max_new
-                                and RECOVERED_ANSWER_FRAGMENT.search(recovered_answer_tail.rstrip())):
+                                and (ANSWER_PREDICATE_FRAGMENT.search(answer_tail.rstrip())
+                                     or (close_retried and RECOVERED_ANSWER_FRAGMENT.search(answer_tail.rstrip())))):
                             # Resume from the exact output prefix. The stop token was never added to seg.
                             answer_retried = True
                             prompt = prompt + seg
                             finish = "length"
-                            print(f"[strata] request={request_id} recovered answer ended on token {stop_token_id} "
+                            print(f"[strata] request={request_id} answer ended on token {stop_token_id} "
                                   "with an incomplete clause; continuing once", flush=True)
                             continue
                         if not (wrap or opens) or cancel.is_set():

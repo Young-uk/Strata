@@ -4295,6 +4295,24 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(c["message"]["content"], self.engine.ANSWER + self.engine.THOUGHT)
         self.assertEqual(c["finish_reason"], "stop")
 
+    def test_naturally_closed_thinking_resumes_an_incomplete_predicate(self):
+        self.svc.reasoning_close_retry = True
+        prefix = "확인할 부분이 있"
+        suffix = "습니다."
+        self.engine.THOUGHT = "ok</think>\n\n" + prefix
+        engine_generate = self.engine.generate
+
+        def generate(ids, max_new, sampling, cancel, embeddings=None):
+            if self.tok.decode(ids).endswith(prefix):
+                self.engine.prompts.append(list(ids))
+                yield from self.tok.encode(suffix) + self.tok.encode("<|im_end|>", parse_special=True)
+            else:
+                yield from engine_generate(ids, max_new, sampling, cancel, embeddings)
+
+        self.engine.generate = generate
+        self.assertEqual(self.chat()["message"]["content"], prefix + suffix)
+        self.assertEqual(len(self.engine.prompts), 2)
+
     def test_a_mid_word_stop_without_thinking_recovery_is_not_touched(self):
         self.svc.reasoning_close_retry = True
         self.engine.THOUGHT = "ok</think>\n\n확률이 제일 높고, 기"
