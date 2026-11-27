@@ -31,6 +31,8 @@
 #include "strata/core/session.hpp"
 #include "strata/core/summary_state_bank.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/cvec.hpp"
+#include <stdexcept>
 #include "strata/kernels/sampler.hpp"
 namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -530,6 +532,10 @@ private:
         std::vector<std::pair<int, int>> qsa;   // (dispatch, kind): 0 QsaArgs n_tok = T, 1 the merge (MAXT), 2 the scores
     };
     std::map<int, Cached> wcache_;
+    mtl::Buffer projection_directions_;
+    int projection_library_ = -1;
+    bool project_ffn(std::vector<mtl::Dispatch>& dispatches, int layer, int tokens,
+                     const mtl::Buffer& residual, const mtl::Buffer& block, const mtl::Buffer& gates);
     bool f16_enc_ = false;   // STRATA_METAL_F16: a decode window is being encoded (the MTP layer stays fp32)
     std::vector<std::pair<int, int>>* rec_ = nullptr;
     // ---- SSD streaming (stream.h): the dense weights in W_, the routed experts in the arena
@@ -1124,10 +1130,38 @@ void Window::had_rows_ind(std::vector<mtl::Dispatch>& ds, int lib, const std::st
     push(ds, d);
 }
 
+bool Window::project_ffn(std::vector<mtl::Dispatch>& dispatches, int layer, int tokens,
+                         const mtl::Buffer& residual, const mtl::Buffer& block, const mtl::Buffer& gates) {
+    const auto& vector = strata::kernels::cvec();
+    if (!strata::kernels::cvec_enabled() || !vector.covers(layer)) return false;
+    if (!projection_directions_.handle) {
+        const size_t bytes = (vector.last + 1) * vector.n_embd * sizeof(float);
+        projection_directions_ = cx_->alloc(bytes);
+        if (!projection_directions_.ptr) throw std::runtime_error("Metal control vector allocation failed");
+        std::memcpy(projection_directions_.ptr, vector.dir, bytes);
+        projection_library_ = cx_->compile({"control_vector.metal"}, "#define NO_GGML_COMMON 1\n");
+    }
+    struct Args { uint32_t width, streams, mode; float scale; };
+    const Args args{N, HC, static_cast<uint32_t>(vector.mode), vector.s[layer]};
+    const size_t offset = layer * vector.n_embd * sizeof(float);
+    mtl::Dispatch dispatch;
+    dispatch.p = P(projection_library_, "control_vector", {}, "control_vector");
+    dispatch.args = {mtl::Arg::B(residual), mtl::Arg::B(block), mtl::Arg::B(gates),
+                     mtl::Arg::B(projection_directions_, offset), mtl::Arg::V(args)};
+    dispatch.grid[0] = HC;
+    dispatch.grid[1] = tokens;
+    dispatch.tg[0] = 256;
+    nb_ = false;   // consumes the preceding FFN block and feeds the next normalization
+    push(dispatches, dispatch);
+    return true;
+}
+
 void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0) {
     const std::string b = "blk." + std::to_string(l) + ".";
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it)
-    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok);
+    const bool pending = l > 0 && !(l == 1 && ple_on_);
+    const bool applied = pending && project_ffn(ds, l - 1, ntok, R_, bo_, inj_[cur_inj_]);
+    gr_read(ds, b + "hc_attn", pending && !applied, XA_, false, ntok);
     if (l % G_QI != G_QI - 1) {
         const int gi = l - l / G_QI;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -1491,9 +1525,10 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
             for (int c = 0; c < G_BUD; ++c) qids_.as<int>()[t * G_BUD + c] = c;
         qdirty_ = false;
     }
-    const int key = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0) + (int) (pend_fold_ * 100)
+    const int shape = rows_ ? 1000000 + Tn * 2 + (sel ? 1 : 0) + (int) (pend_fold_ * 100)
                           : (((((Tn * 2 + (head ? 1 : 0)) * 2 + hp_) * (MAXT + 1)) + pend_fold_) * 2 + (sel ? 1 : 0)) * 2 +
                                 (mrope_on() ? 1 : 0);
+    const int key = shape * 2 + strata::kernels::cvec_enabled();
     mrope_sync(pos0, Tn);
     const int fold_n = pend_fold_;
     pend_fold_ = 0;
@@ -1584,7 +1619,8 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     }
     for (int l = 1; l < G_NL; ++l) layer(ds, l, Tn, pos0);
     // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    const bool projected = project_ffn(ds, G_NL - 1, Tn, R_, bo_, inj_[cur_inj_]);
+    gr_read(ds, "output_hc", !projected, XA_, true, Tn);
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -3441,7 +3477,9 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     (void) MB;
     for (int l = 0; l < G_NL; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
-        hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        const bool pending = l > 0 && !(l == 1 && ple_on_);
+        const bool applied = pending && project_ffn(ds, l - 1, T, p.R, p.bo, p.inj[ci]);
+        hc_read(b + "hc_attn", pending && !applied);
         if (l % 4 != 3) {
             const int gi = l - l / 4;
             dq(TN(b + "attn_qkv.weight"), p.Wqkv);
@@ -3642,7 +3680,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     // the last layer's write applied to R (the draft layer's K/V read the final residual rows)
     {
         const gguf::Tensor& tn = TN("output_hc_norm.weight");
-        GrArgs a{N, HC, LR, (uint32_t) T, 1u, eps_};
+        const bool projected = project_ffn(ds, G_NL - 1, T, p.R, p.bo, p.inj[ci]);
+        GrArgs a{N, HC, LR, (uint32_t) T, projected ? 0u : 1u, eps_};
         D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                               mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
     }

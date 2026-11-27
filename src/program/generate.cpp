@@ -5399,6 +5399,12 @@ int main(int argc, char** argv) {
     std::string cvec_summary = "0";
     uint64_t cvec_digest = 0;   // a session file is bound to the loaded vector (0: none)
     if (!o.cvec_files.empty()) {
+#if defined(STRATA_GPU_METAL)
+        if (o.batch > 0 || o.draft == "dflash2") {
+            std::fprintf(stderr, "strata generate: Metal control vectors require serial decoding with MTP or no drafter\n");
+            return 2;
+        }
+#endif
         std::string ce;
         if (!load_control_vectors(o, g, cvec_summary, cvec_digest, ce)) {
             std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());
@@ -12074,7 +12080,19 @@ int main(int argc, char** argv) {
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
         ConvCheckpoint::PromptPlan seg_plan;
-        bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // Keep the legacy Stock tag (true) for Metal snapshots created without a vector.
+        // Projected states on Metal use the other tag and remain in memory.
+#if defined(STRATA_GPU_METAL)
+        const bool metal_projection = strata::kernels::cvec().loaded();
+#else
+        const bool metal_projection = false;
+#endif
+        auto set_projection_for_state = [&](bool cache_mode) {
+            if (strata::kernels::cvec().loaded())
+                strata::kernels::cvec_set_enabled(metal_projection ? !cache_mode : cache_mode);
+        };
+        bool cvec_cached = true;
+        set_projection_for_state(cvec_cached);
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         // #3493: no --conversation-cache-mib given: size the cache for agent use from the RAM that is free now that the model is
@@ -12216,7 +12234,7 @@ int main(int argc, char** argv) {
                 c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
                           rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
                           rope_cfg.beta_slow};
-                c.cvec = cvec_digest;
+                c.cvec = metal_projection ? 0 : cvec_digest;
                 c.switches = {
                     {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
                     {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
@@ -12280,7 +12298,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation disk cache: unavailable (%s)\n", e.what());
         }
         auto spill_image = [&](const strata::core::SavedConversation& image) {
-            if (!disk_conversations.enabled() || continuation_summary_selected || !image.stage_images.empty()) return;
+            if (!disk_conversations.enabled() || continuation_summary_selected || !image.stage_images.empty() ||
+                (metal_projection && !image.cvec)) return;
             try {
                 std::string why;
                 strata::core::SessionFileIdentity id;
@@ -12301,7 +12320,8 @@ int main(int argc, char** argv) {
             conversations.after_clear = [&] { disk_conversations.clear(); };
         }
         auto spill_source = [&](const ParkSource& src) {
-            if (!disk_conversations.enabled() || continuation_summary_selected || !src.stage_sessions.empty()) return;
+            if (!disk_conversations.enabled() || continuation_summary_selected || !src.stage_sessions.empty() ||
+                (metal_projection && !src.cvec)) return;
             try {
                 std::string why;
                 strata::core::SessionFileIdentity id;
@@ -14410,7 +14430,7 @@ int main(int argc, char** argv) {
             std::swap(check_clock, summary_clock); std::swap(tail_ckpt_len, summary_tail);
             std::swap(seg_plan, summary_plan); std::swap(nf_prompt_windows, summary_nf_prompt);
             std::swap(short_read_off_once, summary_short_read); std::swap(cvec_cached, summary_cvec_cached);
-            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(cvec_cached);
+            set_projection_for_state(cvec_cached);
             o.prompt_cache = summary ? 0 : summary_prompt_cache;
             continuation_summary_selected = summary;
             return true;
@@ -16642,7 +16662,7 @@ int main(int argc, char** argv) {
                     nf_prompt_windows = summary_nf_prompt;
                     short_read_off_once = summary_short_read;
                     cvec_cached = summary_cvec_cached;
-                    if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(cvec_cached);
+                    set_projection_for_state(cvec_cached);
                     summary_pristine = summary_tx.empty_mode();
                     summary_tx.commit_end();
                     return true;
@@ -16693,6 +16713,10 @@ int main(int argc, char** argv) {
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    if (metal_projection && !cvec_cached) {
+                        refuse("projected Metal sessions are kept in memory");
+                        continue;
+                    }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -16911,6 +16935,7 @@ int main(int argc, char** argv) {
                         }), checks.end());
                     }
                     cvec_cached = image.cvec;
+                    set_projection_for_state(cvec_cached);
                     live_ok = true;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
@@ -16949,7 +16974,7 @@ int main(int argc, char** argv) {
             long long req_pen_from = -1;   // pen_from=N: this request continues one that began at token N (the last token of the original prompt): the penalty window starts there
             std::string req_bias_text;
             bool req_bias_present = false;
-            int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            int req_cvec = metal_projection ? 0 : 1;   // optional per-request override
             // logprobs=K (0..20): after each "T id" an "LP logprob id:logprob ..." line.
             // -1 (absent) = no LP lines, so a server that never asks sees today's output.
             int req_logprobs = -1;
@@ -17257,7 +17282,8 @@ int main(int argc, char** argv) {
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
-            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            const bool want_cvec = metal_projection ? req_cvec != 1 :
+                (!strata::kernels::cvec().loaded() || req_cvec != 0);
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -17915,7 +17941,7 @@ int main(int argc, char** argv) {
                 checks.clear();
                 cvec_cached = want_cvec;
             }
-            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+            set_projection_for_state(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             auto off_path = [&](const ConvCheckpoint& c) {

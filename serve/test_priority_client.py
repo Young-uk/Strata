@@ -69,7 +69,13 @@ class ClientTests(unittest.TestCase):
             else:
                 original(generation, command)
         self.e._send_for = send
-        self.assertEqual(list(self.client.generate([4], 1, {}, self.cancel)), [101])
+        from serve.server import StrataEngine
+        self.e.sampling_keys = StrataEngine.sampling_keys
+        sampling = {"experimental_speed_projection": False, "temperature": 0.2}
+        self.assertEqual(list(self.client.generate([4], 1, sampling, self.cancel)), [101])
+        self.assertNotIn('cvec=', self.e.sent[0])
+        self.assertIn('temperature=0.2', self.e.sent[0])
+        self.assertIs(sampling["experimental_speed_projection"], False)
         self.assertTrue(self.e.sent[0].startswith('ARECOVER '))
         self.assertIn(' main 1 ', self.e.sent[0])
         self.assertTrue(self.e.sent[0].endswith('1,2,3,4'))

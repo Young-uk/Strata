@@ -8622,6 +8622,9 @@ def make_handler(svc: Service):
                     self._json(200, {"object": "list", "data": data,
                                      "runtime_id": svc.instance_id, "atomic_runtime_id": svc.instance_id,
                                      "atomic_model_fingerprint": svc.atomic_model_fingerprint,
+                                     **({"atomic_control_vector": True}
+                                        if str((getattr(svc.engine, "info", {}) or {}).get("cvec", 0))
+                                        not in ("0", "", "None") else {}),
                                      "atomic_summary_slot": svc.summary_lane.enabled and not svc.summary_lane.poisoned,
                                      "atomic_summary_context": atomic_summary.CONTEXT,
                                      **({"atomic_auxiliary_agent": 1} if svc.summary_lane.enabled and svc.summary_lane.mode == "state-bank-v1" and svc.summary_lane.scheduler else {}),

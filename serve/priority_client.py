@@ -118,11 +118,14 @@ class ContinuationClient:
                       f"foreground-decode={self.foreground_decode_max}", flush=True)
 
     def _sampling_keys(self, sampling):
-        keys = self.engine.sampling_keys(sampling or {}).strip().split()
+        # Summary continuations inherit the selected bank's model state. A
+        # request-level projection change would invalidate that cached prefix.
+        sampling = {key: value for key, value in (sampling or {}).items()
+                    if key != "experimental_speed_projection"}
+        original = self.engine.sampling_keys(sampling).strip().split()
         # ckpt=0 is inherent for summary; foreground checkpoint/pin options must
         # be explicitly supported rather than silently altered.
-        keys = [key for key in keys if key == "ckpt=0" or key.split("=", 1)[0] in self.SUPPORTED_KEYS]
-        original = self.engine.sampling_keys(sampling or {}).strip().split()
+        keys = [key for key in original if key == "ckpt=0" or key.split("=", 1)[0] in self.SUPPORTED_KEYS]
         unsupported = [key.split("=", 1)[0] for key in original if key not in keys]
         if unsupported:
             raise ValueError("weighted continuation does not support native options: " + ", ".join(sorted(set(unsupported))))

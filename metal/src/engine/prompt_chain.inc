@@ -308,7 +308,9 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     int gi = 0, qi = 0;
     for (int l = 0; l < G_NL; ++l) {
         const std::string bl = "blk." + std::to_string(l) + ".";
-        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        const bool pending = l > 0 && !(l == 1 && ple_on_);
+        const bool applied = pending && project_ffn(ds, l - 1, nT, b.R, b.bo, b.inj[cur_inj]);
+        hc_read(bl + "hc_attn", pending && !applied);
         if (l % G_QI != G_QI - 1) {
             dq(T(bl + "ssm_out.weight"), b.Wout);
             PcGdnPArgs ga{(uint32_t) nT, G_HK, G_HV, G_CONV, eps_, 0};
@@ -517,7 +519,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     }
     // every row's final residual (the last write applied): the drafter's prompt rows
     {
-        GrArgs a{N, HC, LR, (uint32_t) nT, 1u, eps_};
+        const bool projected = project_ffn(ds, G_NL - 1, nT, b.R, b.bo, b.inj[cur_inj]);
+        GrArgs a{N, HC, LR, (uint32_t) nT, projected ? 0u : 1u, eps_};
         D(P_(b.lib, "gr_norm"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
                                 mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a)}, HC, nT, 256);
     }
