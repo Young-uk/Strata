@@ -16,12 +16,29 @@ import os
 import tempfile
 import stat
 import threading
+import time
 import uuid
 from pathlib import Path
 from serve.priority import PriorityCancelled
 
 CONTEXT = 16384
 OUTPUT = 0  # Standard server convention: use the remaining context, not a prose target.
+
+
+def restore_summary_snapshot(engine, path):
+    """Retry only a native RAM preflight refusal on the same live process."""
+    process = getattr(engine, "proc", None)
+    for attempt in range(3):
+        try:
+            return engine.session_file("restore", path)
+        except Exception as exc:
+            if (attempt == 2 or getattr(exc, "kind", None) != "memory"
+                    or getattr(exc, "published", None) is not False
+                    or "not enough RAM to read" not in str(exc) or process is None):
+                raise
+            time.sleep(1 << attempt)
+            if engine.proc is not process or process.poll() is not None:
+                raise
 
 
 class SummaryError(RuntimeError):
@@ -480,7 +497,7 @@ class SummaryLane:
             finally:
                 self.phase = "restoring"
                 with scheduler.control(owner, cleanup=True):
-                    ended = engine.session_file("restore", path)
+                    ended = restore_summary_snapshot(engine, path)
                     if (ended.get("tokens"), ended.get("bytes")) != (saved["tokens"], saved["bytes"]):
                         raise ValueError("recovery rollback identity mismatch")
                     restored = True
@@ -489,6 +506,9 @@ class SummaryLane:
             # any uncertain outcome keeps the artifact and blocks further work.
             clean_refusal = saved is None and getattr(exc, "published", None) is False
             if (saved is not None and not restored) or (saved is None and path and not clean_refusal):
+                print(f"[atomic-summary] serial rollback blocked: phase={self.phase} "
+                      f"error={type(exc).__name__} kind={getattr(exc, 'kind', None)} "
+                      f"scheduler={scheduler.poison_reason}", flush=True)
                 self.poisoned, self.recovery_path = True, path
                 scheduler.poison("serial recovery rollback is uncertain")
                 raise SummaryError("Disk recovery could not restore the original state; snapshot retained and inference blocked",

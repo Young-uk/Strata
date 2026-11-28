@@ -227,7 +227,6 @@ class ContinuationClient:
             raise ValueError("weighted summary continuation requires text generation")
         if type(max_new) is not int or max_new < 1 or not ids:
             raise ValueError("invalid native continuation request")
-        quantum_limit = 1 if owner.summary else self.foreground_decode_max
         keys = self._sampling_keys(sampling) if owner.summary else self.engine.sampling_keys(sampling or {}).strip()
         want_lp = top_logprobs(sampling or {}) is not None
         eos_trace_ids = (sampling or {}).get("_eos_trace_ids", ()) if not (owner.summary or want_lp) else ()
@@ -243,6 +242,10 @@ class ContinuationClient:
                   "decode_ms": None, "reused": 0, "prompt_read": 0, "finish": "cancel"}
         serial = getattr(cancel, "_atomic_serial_recovery", None) if owner.summary else None
         clone = getattr(cancel, "_atomic_clone_snapshot", None) if owner.summary and not serial else None
+        # APREP decodes on the main native lane, even when the scheduler
+        # owns it on behalf of a disk-preserved cold summary.
+        uses_main_decode = not owner.summary or (serial and serial.get("cold"))
+        quantum_limit = self.foreground_decode_max if uses_main_decode else 1
         if serial and serial.get("cold"):
             # APREP runs the ordinary one-shot text parser, which accepts
             # ckpt=0. Do not build temporary conversation checkpoints here.

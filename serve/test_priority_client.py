@@ -92,6 +92,24 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(self.e.sent[0].endswith('4,5,6'))
         self.assertFalse(any(command.startswith(('ARECOVER ', 'AFORK ', 'AGEN ')) for command in self.e.sent))
 
+    def test_cold_summary_accepts_negotiated_main_mtp_quantum(self):
+        self.s.close(self.owner)
+        self.owner = exhaust(self.s.admit(True, self.cancel, recovery=True))
+        self.cancel._priority_owner = self.owner
+        self.cancel._atomic_serial_recovery = {"cold": True}
+        self.client.foreground_decode_max = 4
+        original = self.e._send_for
+        def send(generation, command):
+            if not command.startswith("ANEXT "):
+                return original(generation, command)
+            identity = command.split()[1]
+            for token in (102, 103):
+                self.e.lines.put(f"AT {identity} {token}")
+            self.e.lines.put(f"ADONE {identity} stop 3")
+        self.e._send_for = send
+        self.assertEqual(list(self.client.generate([4, 5, 6], 8, {}, self.cancel)), [101, 102, 103])
+        self.assertFalse(self.s.poison_reason)
+
     def test_capability_exact(self): self.client.discover()
 
     def test_two_tokens_no_stop_or_replay(self):

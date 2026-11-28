@@ -12171,12 +12171,14 @@ int main(int argc, char** argv) {
         // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
         std::optional<uint64_t> model_fp, config_fp;
         std::optional<uint64_t> base_model_fp, base_config_fp;
+        std::optional<uint64_t> projected_config_fp, projected_base_config_fp;
         constexpr size_t draft_replay_tokens = 2051; // Metal draft attention includes the previous 2050 cells.
         size_t draft_warmup_start = 0;
         auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
-                                    const std::function<void()>& next_file, bool base = false) -> bool {
+                                    const std::function<void()>& next_file, bool base = false, bool projected = false) -> bool {
             auto& model_hash = base ? base_model_fp : model_fp;
-            auto& config_hash = base ? base_config_fp : config_fp;
+            auto& config_hash = projected ? (base ? projected_base_config_fp : projected_config_fp)
+                                          : (base ? base_config_fp : config_fp);
             if (!model_hash) {
                 // what the loaders actually resolved: the CLI inputs, the pack's files and - from the expert source
                 // itself - every file its experts were read from (native_experts.txt can name GGUFs per layer/role)
@@ -12234,7 +12236,7 @@ int main(int argc, char** argv) {
                 c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
                           rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
                           rope_cfg.beta_slow};
-                c.cvec = metal_projection ? 0 : cvec_digest;
+                c.cvec = metal_projection && !projected ? 0 : cvec_digest;
                 c.switches = {
                     {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
                     {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
@@ -12298,12 +12300,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation disk cache: unavailable (%s)\n", e.what());
         }
         auto spill_image = [&](const strata::core::SavedConversation& image) {
-            if (!disk_conversations.enabled() || continuation_summary_selected || !image.stage_images.empty() ||
-                (metal_projection && !image.cvec)) return;
+            if (!disk_conversations.enabled() || continuation_summary_selected || !image.stage_images.empty()) return;
             try {
                 std::string why;
                 strata::core::SessionFileIdentity id;
-                if (!session_identity(id, why, {})) return;
+                if (!session_identity(id, why, {}, false, metal_projection && !image.cvec)) return;
                 strata::core::SessionWriteOptions wo;
                 wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                 size_t bytes = 0;
@@ -12320,12 +12321,11 @@ int main(int argc, char** argv) {
             conversations.after_clear = [&] { disk_conversations.clear(); };
         }
         auto spill_source = [&](const ParkSource& src) {
-            if (!disk_conversations.enabled() || continuation_summary_selected || !src.stage_sessions.empty() ||
-                (metal_projection && !src.cvec)) return;
+            if (!disk_conversations.enabled() || continuation_summary_selected || !src.stage_sessions.empty()) return;
             try {
                 std::string why;
                 strata::core::SessionFileIdentity id;
-                if (!session_identity(id, why, {})) return;
+                if (!session_identity(id, why, {}, false, metal_projection && !src.cvec)) return;
                 strata::core::ConversationStateSizes z;
                 if (!strata::core::conversation_session_sizes(g, src.session, z, why)) return;
                 strata::core::SessionSaveLive sl;
@@ -16700,7 +16700,7 @@ int main(int argc, char** argv) {
                 }
                 strata::core::SessionFileIdentity id;
                 try {
-                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); }, restore_base || save_migrated)) {
+                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); }, restore_base || save_migrated, save && metal_projection && !cvec_cached)) {
                         refuse(err, strata::core::SessionError::io);
                         continue;
                     }
@@ -16713,10 +16713,6 @@ int main(int argc, char** argv) {
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
-                    if (metal_projection && !cvec_cached) {
-                        refuse("projected Metal sessions are kept in memory");
-                        continue;
-                    }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -16854,8 +16850,20 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         strata::core::SessionStatus st;
+                        bool projected_file = false;
                         if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
-                            refuse(err, st.error);
+                            // Stock sessions retain their original fingerprint. A projected
+                            // session must pass the same reader using this vector's fingerprint.
+                            if (!metal_projection || err != "session file: saved with another engine configuration (config fingerprint differs)" ||
+                                !session_identity(id, err, {}, restore_base, true) ||
+                                !strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                                refuse(err, st.error);
+                                continue;
+                            }
+                            projected_file = true;
+                        }
+                        if (metal_projection && projected_file == image.cvec) {
+                            refuse("session projection mode disagrees with its fingerprint");
                             continue;
                         }
                     } catch (const std::bad_alloc&) {
@@ -17576,7 +17584,7 @@ int main(int argc, char** argv) {
                         };
                         strata::core::SavedConversation restored;
                         size_t bytes = 0;
-                        if (session_identity(id, why, {}) &&
+                        if (session_identity(id, why, {}, false, metal_projection && !want_cvec) &&
                             strata::core::conversation_session_read_limits(limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
                                 uint64_t(o.max_context), uint64_t(std::max(o.prompt_cache, 1)), why) &&
                             strata::core::session_file_read(file, id, restored, bytes, why, limits)) {

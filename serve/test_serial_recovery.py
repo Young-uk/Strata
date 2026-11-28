@@ -109,6 +109,28 @@ class Recovery(unittest.TestCase):
             self.assertIs(self.scheduler._next(), self.owner)
             self.owner.ready = False
         self.assertIs(self.scheduler._next(), fg)
+    def test_transient_restore_ram_refusal_preserves_original(self):
+        from unittest.mock import Mock, patch
+        self.engine.proc = Mock()
+        self.engine.proc.poll.return_value = None
+        original = self.engine.session_file
+        attempts = []
+        def session(action, path):
+            if action == "restore":
+                attempts.append(path)
+                if len(attempts) == 1:
+                    error = RuntimeError("session file: not enough RAM to read it")
+                    error.kind, error.published = "memory", False
+                    raise error
+            return original(action, path)
+        self.engine.session_file = session
+        with patch("serve.atomic_summary.time.sleep"):
+            with self.lane.serial_recovery(self.engine, self.cancel):
+                self.engine.main = "summary"
+        self.assertEqual(self.engine.main, "original")
+        self.assertEqual(attempts, [attempts[0]] * 2)
+        self.assertFalse(self.lane.poisoned)
+
     def test_restore_failure_keeps_disk_artifact_and_blocks_inference(self):
         self.engine.fail_restore = True
         with self.assertRaises(SummaryError):
